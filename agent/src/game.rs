@@ -116,6 +116,8 @@ pub fn layout() -> &'static Layout {
 
 pub(crate) const CONTRACT_OWNER: u64 = 0x08;
 pub(crate) const CONTRACT_TEAM: u64 = 0x10;
+/// u8 soort baan (1 = speler)
+const CONTRACT_JOB: u64 = 0x26;
 const CONTRACT_WAGE: u64 = 0x20;
 const CONTRACT_UNHAPPINESS: u64 = 0x30;
 const CONTRACT_EXPIRES: u64 = 0x48;
@@ -135,6 +137,13 @@ const FIN_TOTAL_WAGE: u64 = 0x808;
 const FIN_WAGE: u64 = 0x814;
 const FIN_TICKET: u64 = 0x864;
 const FIN_CORPORATE: u64 = 0x8A9;
+
+/// Plek van een veld in het financiënblok. Op een build waarvan de indeling (nog) niet bekend is,
+/// kan de app het achterste deel (transferbudget en verder) een stukje verschoven vinden
+/// (`calibrate`); het saldo vooraan blijft waar het was.
+pub(crate) fn fin(finance: u64, field: u64) -> u64 {
+    if field >= FIN_TRANSFER { finance.wrapping_add_signed(calibration().fin_delta) + field } else { finance + field }
+}
 
 const INJ_KIND: u64 = 0x08;
 const INJ_KIND_NAME: u64 = 0x18;
@@ -246,9 +255,18 @@ fn read_ptr_list(pair: u64) -> Option<Vec<u64>> {
 /// onderlinge afstand, waarvan het tweede clubs bevat (UID + naam) en het eerste een manager wiens
 /// keten (contract → team → club → financiën) klopt en bij een club uit die lijst uitkomt.
 fn discover(img: &mem::Image) -> Option<Statics> {
-    let span = STAFF_TO_CLUBS as usize + 16;
-    // (kleinste van beide lijsten, adres van het staf-paar)
-    let mut cands: Vec<(u64, u64)> = Vec::new();
+    discover_with(img, &mut |_| {})
+}
+
+/// Hoe ver het clubpaar achter het stafpaar mag liggen als de vaste afstand (0x170) niet klopt.
+const STAFF_TO_CLUBS_MAX: u64 = 0x400;
+
+/// `discover`, met een verslag van elke stap (voor `diagnose`).
+fn discover_with(img: &mem::Image, note: &mut dyn FnMut(String)) -> Option<Statics> {
+    let max = STAFF_TO_CLUBS_MAX as usize;
+    let span = max + 16;
+    // (afstand wijkt af van 0x170, -(kleinste van beide lijsten), adres van het staf-paar, afstand)
+    let mut cands: Vec<(bool, i64, u64, u64)> = Vec::new();
     mem::for_each_chunk(img.start, img.end, 8 << 20, span, &mut |a, buf| {
         if buf.len() < span {
             return;
@@ -258,36 +276,62 @@ fn discover(img: &mem::Image) -> Option<Statics> {
         while i + span <= buf.len() {
             let (b, e) = (w(i), w(i + 8));
             if b != 0 && ptr_pair(b, e) {
-                let c = i + STAFF_TO_CLUBS as usize;
-                let (cb, ce) = (w(c), w(c + 8));
-                if ptr_pair(cb, ce) {
-                    cands.push(((e - b).min(ce - cb) / 8, a + i as u64));
+                let mut d = 0x10;
+                while d <= max {
+                    let (cb, ce) = (w(i + d), w(i + d + 8));
+                    // op een andere afstand dan de bekende alleen echte, grote lijsten
+                    let usual = d as u64 == STAFF_TO_CLUBS;
+                    if ptr_pair(cb, ce) && (usual || ((e - b) / 8 >= 100 && (ce - cb) / 8 >= 100)) {
+                        let size = (e - b).min(ce - cb) / 8;
+                        cands.push((d as u64 != STAFF_TO_CLUBS, -(size as i64), a + i as u64, d as u64));
+                    }
+                    d += 8;
                 }
             }
             i += 8;
         }
     });
     // Gemeten op de Mac (build 26577676, 12 nov 2026): 1.945 zulke dubbele paren in __DATA, het echte
-    // (21.852 stafleden, 22.141 clubs) op één na het grootste. De grootste dus eerst, en niet eindeloos.
-    cands.sort_unstable_by(|x, y| y.cmp(x));
+    // (21.852 stafleden, 22.141 clubs) op één na het grootste. De bekende afstand eerst, dan de
+    // grootste lijsten, en niet eindeloos. Op een andere afstand tellen lijsten met minder dan 100
+    // elementen niet mee: elke database heeft duizenden clubs en stafleden.
+    cands.sort_unstable();
     cands.dedup();
-    cands.truncate(512);
-    for (_, staff) in cands {
-        let clubs = staff + STAFF_TO_CLUBS;
+    note(format!("{} kandidaat-paren", cands.len()));
+    cands.truncate(4096);
+    let mut clubs_seen = 0;
+    for (_, _, staff, d) in cands {
+        let clubs = staff + d;
         let Some(club_list) = read_ptr_list(clubs) else { continue };
         let sample: Vec<u64> = club_list.iter().copied().filter(|p| mem::is_ptr(*p)).take(32).collect();
         let named = sample.iter().filter(|c| club_name(**c).is_some() && mem::u32_at(**c + CLUB_UID).is_some_and(|u| u != 0)).count();
         if sample.is_empty() || named * 2 < sample.len() {
             continue;
         }
+        clubs_seen += 1;
         let Some(staff_list) = read_ptr_list(staff) else { continue };
-        let Some(chain) = staff_list.into_iter().filter(|p| mem::is_ptr(*p)).find_map(check_chain) else { continue };
+        let staff_list: Vec<u64> = staff_list.into_iter().filter(|p| mem::is_ptr(*p)).collect();
+        note(format!("clublijst? RVA {:#x} ({} clubs), staf RVA {:#x} ({} stafleden), afstand {d:#x}", clubs - img.start, club_list.len(), staff - img.start, staff_list.len()));
+        let mut chain = staff_list.iter().copied().find_map(check_chain);
+        if chain.is_none() && with_state(|s| s.calibration).is_none() {
+            if let Some(cal) = calibrate(&staff_list) {
+                note(format!("plekken afwijkend: {cal:?}"));
+                with_state(|s| s.calibration = Some(cal));
+                chain = staff_list.iter().copied().find_map(check_chain);
+            }
+        }
+        let Some(chain) = chain else {
+            note("  geen manager met kloppende keten in deze staflijst".into());
+            continue;
+        };
         if !club_list.contains(&chain.club) {
+            note("  club van de manager staat niet in deze clublijst".into());
             continue;
         }
         let date = discover_date(img, staff, &chain);
         return Some(Statics { staff, clubs, date, discovered: true });
     }
+    note(format!("geen staf- en clublijst gevonden ({clubs_seen} lijsten met clubs bekeken)"));
     None
 }
 
@@ -380,6 +424,42 @@ struct State {
     /// (begin van game_plugin, de zelf opgezochte vaste plekken) op een build zonder profiel
     discovered: Option<(u64, Statics)>,
     discover_failed: Option<std::time::Instant>,
+    /// afwijkende plekken van het contract, het identiteitsblok en de financiën, zelf gevonden op
+    /// een build waarop de bekende plekken niet kloppen (None = de bekende plekken)
+    calibration: Option<Calibration>,
+    /// laatste vergeefse kalibratie: niet bij elke verbindingscontrole opnieuw (zonder save is er niets)
+    calibrate_failed: Option<std::time::Instant>,
+}
+
+/// De plekken die de keten manager → contract → team → club → financiën gebruikt. Normaal uit
+/// `Layout`; na een FM-patch die de objecten verschuift, zelf gevonden (`calibrate`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Calibration {
+    /// contract-pointer in het managerobject (inclusief `human_shift`)
+    pub contract: u64,
+    /// identiteitsblok in het managerobject, waar het contract naar terugwijst
+    pub identity: u64,
+    /// verschuiving van het achterste deel van het financiënblok
+    pub fin_delta: i64,
+}
+
+fn nominal_calibration() -> Calibration {
+    let l = layout();
+    Calibration { contract: l.staff_contract + l.human_shift, identity: l.staff_identity + l.human_shift, fin_delta: 0 }
+}
+
+pub(crate) fn calibration() -> Calibration {
+    with_state(|s| s.calibration).unwrap_or_else(nominal_calibration)
+}
+
+/// Afwijkende plekken in gebruik? (dan alleen lezen, tenzij de gebruiker aanpassen toestaat)
+pub fn calibrated() -> Option<serde_json::Value> {
+    let c = with_state(|s| s.calibration)?;
+    let n = nominal_calibration();
+    Some(serde_json::json!({
+        "contract": format!("{:#x}", c.contract), "identity": format!("{:#x}", c.identity), "fin_delta": c.fin_delta,
+        "nominal_contract": format!("{:#x}", n.contract), "nominal_identity": format!("{:#x}", n.identity),
+    }))
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -416,6 +496,64 @@ pub fn discover_report() -> Result<serde_json::Value, String> {
     }))
 }
 
+/// Diagnose voor een gebruiker bij wie de app niet verbindt (na een FM-patch): elke stap van de
+/// verbinding met wat hij vond, zonder iets te schrijven. Het resultaat kan de gebruiker in een
+/// melding plakken.
+pub fn diagnose() -> serde_json::Value {
+    use serde_json::json;
+    let Some(img) = mem::game_plugin() else {
+        return json!({"game_plugin": null, "hint": "game_plugin niet geladen: is FM gestart en een save geladen? / game_plugin not loaded"});
+    };
+    with_state(|s| s.calibrate_failed = None); // de diagnose zoekt altijd opnieuw
+    let prof = profile(img.id.as_deref());
+    let mut steps: Vec<String> = Vec::new();
+    // de vaste plekken: uit het profiel, of opgezocht met verslag
+    let t = std::time::Instant::now();
+    let st = match prof {
+        Some(_) => statics(&img),
+        None => {
+            let found = discover_with(&img, &mut |m| steps.push(m));
+            if let Some(f) = found {
+                with_state(|s| s.discovered = Some((img.start, f)));
+            }
+            found
+        }
+    };
+    let rva = |a: u64| format!("{:#x}", a.wrapping_sub(img.start));
+    let staff_list = st.and_then(|s| read_ptr_list(s.staff)).unwrap_or_default();
+    let club_list = st.and_then(|s| read_ptr_list(s.clubs)).unwrap_or_default();
+    let named = club_list.iter().filter(|c| mem::is_ptr(**c)).take(32).filter(|c| club_name(**c).is_some()).count();
+    // de manager, langs elke weg
+    let rtti_vts = rtti::vtables_of(&img, &rtti::decorated("db", "HUMAN_NON_PLAYER"));
+    let rtti_inst = rtti::instances(&rtti_vts, 64);
+    let via_staff = humans_via_staff(&img).len();
+    let via_rtti = rtti_inst.iter().filter(|h| check_chain(**h).is_some()).count();
+    let via_list = humans_via_manager_list(&img).len();
+    let humans = humans();
+    json!({
+        "build": img.id,
+        "build_label": prof.map(|b| b.label),
+        "image_size": format!("{:#x}", img.end - img.start),
+        "statics": st.map(|s| json!({"staff": rva(s.staff), "clubs": rva(s.clubs), "date": s.date.map(rva), "discovered": s.discovered})),
+        "discover_steps": steps,
+        "staff_list": staff_list.len(),
+        "club_list": club_list.len(),
+        "clubs_named_of_32": named,
+        "human_non_player_vtables": rtti_vts.len(),
+        "human_non_player_instances": rtti_inst.len(),
+        "managers_via_staff": via_staff,
+        "managers_via_rtti": via_rtti,
+        "managers_via_manager_list": via_list,
+        "calibration": calibrated(),
+        "managers": match &humans {
+            Ok(v) => json!(v.iter().map(|c| json!({"club": club_name(c.club), "uid": mem::u32_at(c.club + CLUB_UID)})).collect::<Vec<_>>()),
+            Err(e) => json!(e),
+        },
+        "game_date": game_date().ok(),
+        "ms": t.elapsed().as_millis() as u64,
+    })
+}
+
 /// De naam van de build als hij bekend is ("Steam 26577676 Windows").
 pub fn build_label() -> Option<&'static str> {
     let id = mem::game_plugin().and_then(|i| i.id);
@@ -442,6 +580,7 @@ pub fn reset() {
 /// Mag er op deze build geschreven worden?
 pub(crate) fn writes_allowed() -> Result<(), String> {
     let (id, tested) = build();
+    let tested = tested && with_state(|s| s.calibration).is_none();
     if !tested && !allow_untested() {
         return Err(format!(
             "deze FM-versie ({}) is nog niet getest: alleen lezen. Zet in Instellingen 'Aanpassen op niet-geteste FM-versie' aan om het toch te proberen. / This FM build ({0}) is not verified yet: read-only. Turn on 'Allow changes on an untested FM build' in Settings to try anyway.",
@@ -523,13 +662,16 @@ pub struct Chain {
 }
 
 fn check_chain(h: u64) -> Option<Chain> {
-    let l = layout();
-    let contract = mem::u64_at(h + l.staff_contract + l.human_shift)?;
+    check_chain_with(h, &calibration())
+}
+
+fn check_chain_with(h: u64, cal: &Calibration) -> Option<Chain> {
+    let contract = mem::u64_at(h + cal.contract)?;
     if !mem::is_ptr(contract) {
         return None;
     }
     // het contract wijst terug naar het identiteitsblok van de manager
-    if mem::u64_at(contract + CONTRACT_OWNER)? != h + l.staff_identity + l.human_shift {
+    if mem::u64_at(contract + CONTRACT_OWNER)? != h + cal.identity {
         return None;
     }
     let team = mem::u64_at(contract + CONTRACT_TEAM)?;
@@ -541,19 +683,71 @@ fn check_chain(h: u64) -> Option<Chain> {
         return None;
     }
     let finance = mem::u64_at(club + CLUB_FINANCE)?;
-    if !mem::is_ptr(finance) || !finance_looks_real(finance) {
+    if !mem::is_ptr(finance) || !finance_fits(finance, cal.fin_delta) {
         return None;
     }
     Some(Chain { human: h, contract, team, club, finance })
 }
 
+/// Hoe ver de plekken van het contract en het identiteitsblok mogen afwijken van de bekende. Klein
+/// gehouden: een speler-trainer in de staflijst heeft zijn contract 0xC0 vóór dat van een manager
+/// (Windows), een gewone stafmedewerker 0x340.
+const CAL_WINDOW: u64 = 0x40;
+/// en hoe ver het achterste deel van het financiënblok
+const CAL_FIN_WINDOW: i64 = 0x80;
+
+/// Zoekt bij een manager wiens keten met de bekende plekken niet klopt (na een FM-patch die de
+/// objecten verschoven heeft) de plekken die wél kloppen: een contract-pointer vlak bij de bekende
+/// plek, die terugwijst naar het object (vlak bij het bekende identiteitsblok), geen spelerscontract
+/// is, en via team en club bij een club met naam en financiën uitkomt. Eerst de kleinste afwijking.
+fn calibrate(cands: &[u64]) -> Option<Calibration> {
+    let n = nominal_calibration();
+    let lo = n.contract.saturating_sub(CAL_WINDOW);
+    let len = (2 * CAL_WINDOW + 8) as usize;
+    // afwijkingen van de contract-plek, kleinste eerst
+    let mut offs: Vec<u64> = (0..len as u64 / 8).map(|i| lo + i * 8).collect();
+    offs.sort_by_key(|o| o.abs_diff(n.contract));
+    for &h in cands.iter().filter(|h| mem::is_ptr(**h)) {
+        let Some(bytes) = mem::read_bytes(h + lo, len) else { continue };
+        for &o in &offs {
+            let i = (o - lo) as usize;
+            let contract = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
+            if !mem::is_ptr(contract) {
+                continue;
+            }
+            let Some(owner) = mem::u64_at(contract + CONTRACT_OWNER) else { continue };
+            let Some(identity) = owner.checked_sub(h).filter(|id| id.abs_diff(n.identity) <= CAL_WINDOW && id % 4 == 0) else { continue };
+            if mem::u8_at(contract + CONTRACT_JOB) == Some(1) {
+                continue; // een speler
+            }
+            let Some(team) = mem::u64_at(contract + CONTRACT_TEAM).filter(|t| mem::is_ptr(*t)) else { continue };
+            let Some(club) = mem::u64_at(team + TEAM_CLUB).filter(|c| mem::is_ptr(*c)) else { continue };
+            if club_name(club).is_none() || !mem::u32_at(club + CLUB_UID).is_some_and(|u| u != 0) {
+                continue;
+            }
+            let Some(finance) = mem::u64_at(club + CLUB_FINANCE).filter(|f| mem::is_ptr(*f)) else { continue };
+            let mut deltas: Vec<i64> = (-CAL_FIN_WINDOW / 4..=CAL_FIN_WINDOW / 4).map(|d| d * 4).collect();
+            deltas.sort_by_key(|d| d.abs());
+            if let Some(fin_delta) = deltas.into_iter().find(|d| finance_fits(finance, *d)) {
+                return Some(Calibration { contract: o, identity, fin_delta });
+            }
+        }
+    }
+    None
+}
+
 pub(crate) fn finance_looks_real(f: u64) -> bool {
+    finance_fits(f, calibration().fin_delta)
+}
+
+fn finance_fits(f: u64, delta: i64) -> bool {
+    let g = f.wrapping_add_signed(delta);
     let (Some(tp), Some(corp), Some(tb), Some(wb), Some(twb)) = (
-        mem::f32_at(f + FIN_TICKET),
-        mem::u8_at(f + FIN_CORPORATE),
-        mem::i32_at(f + FIN_TRANSFER),
-        mem::i32_at(f + FIN_WAGE),
-        mem::i32_at(f + FIN_TOTAL_WAGE),
+        mem::f32_at(g + FIN_TICKET),
+        mem::u8_at(g + FIN_CORPORATE),
+        mem::i32_at(g + FIN_TRANSFER),
+        mem::i32_at(g + FIN_WAGE),
+        mem::i32_at(g + FIN_TOTAL_WAGE),
     ) else {
         return false;
     };
@@ -630,6 +824,34 @@ fn humans_via_manager_list(img: &mem::Image) -> Vec<Chain> {
     Vec::new()
 }
 
+/// Objecten die een menselijke manager kunnen zijn, zonder de keten te controleren: de exemplaren
+/// van `db::HUMAN_NON_PLAYER` (RTTI), de lijst van `HUMAN_NON_PLAYER_MANAGER` en de staflijst.
+fn human_candidates(img: &mem::Image) -> Vec<u64> {
+    let mut out: Vec<u64> = Vec::new();
+    let vts = rtti::vtables_of(img, &rtti::decorated("db", "HUMAN_NON_PLAYER"));
+    out.extend(rtti::instances(&vts, 64));
+    let mut names = rtti::decorated("db", "HUMAN_NON_PLAYER_MANAGER");
+    names.extend([".?AVHUMAN_NON_PLAYER_MANAGER@@".to_string(), ".?AUHUMAN_NON_PLAYER_MANAGER@@".to_string()]);
+    for obj in rtti::instances(&rtti::vtables_of(img, &names), 64) {
+        let Some(bytes) = mem::read_bytes(obj, 0x200) else { continue };
+        let words: Vec<u64> = bytes.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
+        for w in words.windows(2) {
+            let (begin, end) = (w[0], w[1]);
+            if mem::is_ptr(begin) && end > begin && (end - begin) % 8 == 0 && (end - begin) / 8 <= 64 {
+                if let Some(list) = mem::read_bytes(begin, (end - begin) as usize) {
+                    out.extend(list.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).filter(|p| mem::is_ptr(*p)));
+                }
+            }
+        }
+    }
+    if let Some(list) = statics(img).and_then(|st| read_ptr_list(st.staff)) {
+        out.extend(list.into_iter().filter(|p| mem::is_ptr(*p)));
+    }
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|p| seen.insert(*p));
+    out
+}
+
 /// Alle menselijke managers met een club (een save kan er meer dan één hebben), elk één keer.
 fn humans() -> Result<Vec<Chain>, String> {
     let img = mem::game_plugin().ok_or("game_plugin niet geladen (laadt FM nog?) / game_plugin not loaded yet")?;
@@ -639,6 +861,20 @@ fn humans() -> Result<Vec<Chain>, String> {
         Abi::Msvc => or(or(humans_via_staff(&img), &|| humans_via_rtti(&img)), &|| humans_via_manager_list(&img)),
         Abi::Itanium => or(humans_via_rtti(&img), &|| humans_via_staff(&img)),
     };
+    let now = std::time::Instant::now();
+    let recently = with_state(|s| s.calibrate_failed.is_some_and(|t| now.duration_since(t).as_secs() < 30));
+    if found.is_empty() && with_state(|s| s.calibration).is_none() && !recently {
+        // De bekende plekken kloppen bij geen enkele kandidaat: misschien heeft een FM-patch de
+        // objecten verschoven. Zoek de plekken die wél kloppen en probeer opnieuw.
+        let cands = human_candidates(&img);
+        match calibrate(&cands) {
+            Some(cal) => {
+                with_state(|s| s.calibration = Some(cal));
+                found = cands.into_iter().filter_map(check_chain).collect();
+            }
+            None => with_state(|s| s.calibrate_failed = Some(now)),
+        }
+    }
     let mut seen = std::collections::HashSet::new();
     found.retain(|c| seen.insert(c.human));
     if found.is_empty() {
@@ -769,10 +1005,10 @@ pub fn club() -> Result<ClubInfo, String> {
     Ok(ClubInfo {
         uid: mem::u32_at(c.club + CLUB_UID).unwrap_or(0),
         name,
-        balance: mem::i32_at(c.finance + FIN_BALANCE).unwrap_or(0),
-        transfer_budget: mem::i32_at(c.finance + FIN_TRANSFER).unwrap_or(0),
-        wage_budget: mem::i32_at(c.finance + FIN_WAGE).unwrap_or(0),
-        total_wage_budget: mem::i32_at(c.finance + FIN_TOTAL_WAGE).unwrap_or(0),
+        balance: mem::i32_at(fin(c.finance, FIN_BALANCE)).unwrap_or(0),
+        transfer_budget: mem::i32_at(fin(c.finance, FIN_TRANSFER)).unwrap_or(0),
+        wage_budget: mem::i32_at(fin(c.finance, FIN_WAGE)).unwrap_or(0),
+        total_wage_budget: mem::i32_at(fin(c.finance, FIN_TOTAL_WAGE)).unwrap_or(0),
     })
 }
 
@@ -786,19 +1022,19 @@ pub fn set_finances(transfer: Option<i64>, wage: Option<i64>, balance: Option<i6
     let clamp = |v: i64| v.clamp(0, i32::MAX as i64) as i32;
     let mut patches = Vec::new();
     if let Some(t) = transfer {
-        patches.push(i32_patch(c.finance + FIN_TRANSFER, clamp(t))?);
+        patches.push(i32_patch(fin(c.finance, FIN_TRANSFER), clamp(t))?);
     }
     if let Some(w) = wage {
         let w = clamp(w);
-        patches.push(i32_patch(c.finance + FIN_WAGE, w)?);
+        patches.push(i32_patch(fin(c.finance, FIN_WAGE), w)?);
         // het totale loonbudget mag niet lager zijn dan het loonbudget
-        let total = mem::i32_at(c.finance + FIN_TOTAL_WAGE).unwrap_or(0);
+        let total = mem::i32_at(fin(c.finance, FIN_TOTAL_WAGE)).unwrap_or(0);
         if total < w {
-            patches.push(i32_patch(c.finance + FIN_TOTAL_WAGE, w)?);
+            patches.push(i32_patch(fin(c.finance, FIN_TOTAL_WAGE), w)?);
         }
     }
     if let Some(b) = balance {
-        patches.push(i32_patch(c.finance + FIN_BALANCE, b.clamp(i32::MIN as i64, i32::MAX as i64) as i32)?);
+        patches.push(i32_patch(fin(c.finance, FIN_BALANCE), b.clamp(i32::MIN as i64, i32::MAX as i64) as i32)?);
     }
     if patches.is_empty() {
         return club();

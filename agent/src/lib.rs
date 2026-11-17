@@ -4,7 +4,7 @@
 //! - macOS: de app start FM27 met deze bibliotheek (DYLD_INSERT_LIBRARIES; FM27 staat dat toe
 //!   via zijn entitlements, zie FMSuperScout docs/macos.md). Ze luistert op een lokale socket.
 //! - Windows: de app gebruikt dezelfde code rechtstreeks (`request`) en leest fm.exe van buitenaf.
-#![cfg(any(target_os = "macos", windows))]
+#![cfg(any(target_os = "macos", windows, test))]
 
 pub mod game;
 mod mem;
@@ -166,6 +166,8 @@ pub fn dispatch(req: &Value) -> Result<Value, String> {
                 "statics": game::statics_source(),
                 "platform": if mem::abi() == mem::Abi::Msvc { "windows" } else { "macos" },
                 "untested_writes": game::allow_untested(),
+                // afwijkende plekken van manager/financiën, zelf gevonden na een FM-patch (anders null)
+                "calibration": game::calibrated(),
             }))
         }
         "allow_untested" => {
@@ -233,6 +235,7 @@ pub fn dispatch(req: &Value) -> Result<Value, String> {
             json!({"human": format!("{:#x}", c.human), "contract": format!("{:#x}", c.contract), "team": format!("{:#x}", c.team), "club": format!("{:#x}", c.club), "finance": format!("{:#x}", c.finance)})
         }),
         "discover" => game::discover_report(),
+        "diagnose" => Ok(game::diagnose()),
         "census" => {
             let img = mem::game_plugin().ok_or("game_plugin niet geladen")?;
             let filter = req.get("filter").and_then(|v| v.as_str()).unwrap_or("TRAIN");

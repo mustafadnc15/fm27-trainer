@@ -59,7 +59,7 @@ met `expect`), `discover`. Zie `agent/src/lib.rs`.
 
 - Rust stable met de MSVC-toolchain (`rustup default stable-x86_64-pc-windows-msvc`) en Visual Studio Build Tools
   (workload "Desktop development with C++").
-- `cargo test -p fm27-agent`: 12 tests, `cargo test -p fm27-trainer`: 3 tests (nagemaakte taartmeters); horen allemaal te slagen.
+- `cargo test -p fm27-agent`: 14 tests (draaien sinds 17 nov 2026 ook op Linux, tegen gesimuleerd geheugen), `cargo test -p fm27-trainer`: 3 tests (nagemaakte taartmeters); horen allemaal te slagen.
 - `cargo run -p fm27-trainer`: de app. `cargo build --release -p fm27-trainer` → `target\release\fm27-trainer.exe`
   (statische C-runtime via `.cargo/config.toml`).
 - **De release-exe heeft geen console** (`windows_subsystem = "windows"`). Gebruik voor de CLI de debug-build:
@@ -202,6 +202,27 @@ met `expect`), `discover`. Zie `agent/src/lib.rs`.
   AVFoundation/CoreMedia), de arm64-helft niet. xcap is nu alleen nog een afhankelijkheid buiten macOS
   (`app/Cargo.toml`); de Mac heeft zijn eigen opname. De Intel-build heeft geen Swift-koppeling meer en start
   onder Rosetta (`arch -x86_64 … help`). Niet op een echte Intel-Mac getest.
+
+## Steam-update van 17 nov 2026 (GitHub #6, "Not connecting", nog niet uitgebracht)
+
+- Melding: na de Steam-update van 17 nov verbindt de app niet meer (Windows, de melder had 0.2.3). Build-id,
+  logs en een profiel van FMLibreEditor waren er nog niet; **de oorzaak is niet gemeten**. Geen FM in deze sessie.
+- Daarom de app robuuster gemaakt voor een patch die objecten verschuift, alles alleen in simulatie getest:
+  - **Kalibratie** (`calibrate` in `agent/src/game.rs`): als de keten manager → contract → team → club →
+    financiën met de bekende plekken bij geen enkele kandidaat klopt, zoekt de app de contract-pointer binnen
+    ±0x40 van de bekende plek (terugwijzend naar het object, binnen ±0x40 van het identiteitsblok, geen
+    spelerscontract `+0x26 == 1`, club met naam en UID) en het achterste deel van het financiënblok
+    (transferbudget en verder) binnen ±0x80. Kleinste afwijking eerst. Het venster is bewust klein: een
+    speler-trainer heeft zijn contract 0xC0 vóór dat van een manager. Zolang er gekalibreerd is, is
+    schrijven uit tot `allow_untested`, ook op een bekende build. `ping` geeft `calibration`.
+  - `discover` neemt nu ook een clubpaar op een andere afstand dan 0x170 (tot 0x400; dan alleen lijsten
+    van ≥ 100 elementen), de bekende afstand eerst.
+  - Opdracht **`diagnose`** (alleen lezen): build, vaste plekken met elke stap van het zoeken, lengte van
+    staf- en clublijst, manager langs elke weg (staflijst, RTTI, managerlijst), kalibratie, datum. In de
+    app: Instellingen → "Diagnose FM-verbinding" → `diagnose.json` in de app-map.
+  - Tests `patch_that_moves_fields_is_calibrated`, `known_layout_is_not_calibrated`.
+- Volgende stap: de melder `diagnose.json` laten sturen (of de build-id uit `ping`), en zodra FMLibreEditor
+  een profiel voor de nieuwe build heeft, het in `BUILDS` zetten.
 
 ## Veiligheidsregels (altijd)
 

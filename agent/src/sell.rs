@@ -513,36 +513,36 @@ fn relocate(purchase: bool, uid: u32, other_uid: u32, fee: i64, wage: Option<i64
     // geld. Verkopen: de koper betaalt (saldo en transferbudget, niet onder nul), jij ontvangt de
     // som op je saldo én in je transferbudget (FM zelf maakt het deel vrij dat het bestuur
     // toestaat; de app alles, bijstellen kan op de clubpagina). Kopen: andersom.
-    let balance = mem::i32_at(chain.finance + FIN_BALANCE).unwrap_or(0) as i64;
-    let transfer_budget = mem::i32_at(chain.finance + FIN_TRANSFER).unwrap_or(0).max(0) as i64;
+    let balance = mem::i32_at(game::fin(chain.finance, FIN_BALANCE)).unwrap_or(0) as i64;
+    let transfer_budget = mem::i32_at(game::fin(chain.finance, FIN_TRANSFER)).unwrap_or(0).max(0) as i64;
     let mut deltas = Vec::new();
     let (balance_after, transfer_budget_after) = if purchase {
         let left = (transfer_budget - fee).max(0);
-        deltas.push((chain.finance + FIN_BALANCE, -fee));
+        deltas.push((game::fin(chain.finance, FIN_BALANCE), -fee));
         if left != transfer_budget {
-            deltas.push((chain.finance + FIN_TRANSFER, left - transfer_budget));
+            deltas.push((game::fin(chain.finance, FIN_TRANSFER), left - transfer_budget));
         }
         (balance - fee, left)
     } else {
         if balance + fee > i32::MAX as i64 || transfer_budget + fee > i32::MAX as i64 {
             return Err("je saldo of transferbudget zou te groot worden / balance or transfer budget would overflow".into());
         }
-        deltas.push((chain.finance + FIN_BALANCE, fee));
-        deltas.push((chain.finance + FIN_TRANSFER, fee));
+        deltas.push((game::fin(chain.finance, FIN_BALANCE), fee));
+        deltas.push((game::fin(chain.finance, FIN_TRANSFER), fee));
         (balance + fee, transfer_budget + fee)
     };
     let mut buyer_pays = false;
     if let Some(f) = mem::u64_at(other.addr + CLUB_FINANCE).filter(|f| mem::is_ptr(*f) && game::finance_looks_real(*f)) {
         buyer_pays = true;
         if purchase {
-            deltas.push((f + FIN_BALANCE, fee));
-            deltas.push((f + FIN_TRANSFER, fee));
+            deltas.push((game::fin(f, FIN_BALANCE), fee));
+            deltas.push((game::fin(f, FIN_TRANSFER), fee));
         } else {
-            deltas.push((f + FIN_BALANCE, -fee));
-            if let Some(tb) = mem::i32_at(f + FIN_TRANSFER).filter(|tb| *tb >= 0) {
+            deltas.push((game::fin(f, FIN_BALANCE), -fee));
+            if let Some(tb) = mem::i32_at(game::fin(f, FIN_TRANSFER)).filter(|tb| *tb >= 0) {
                 let left = (tb as i64 - fee).max(0);
                 if left != tb as i64 {
-                    deltas.push((f + FIN_TRANSFER, left - tb as i64));
+                    deltas.push((game::fin(f, FIN_TRANSFER), left - tb as i64));
                 }
             }
         }

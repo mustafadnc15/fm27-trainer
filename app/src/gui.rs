@@ -2294,6 +2294,20 @@ impl App {
                     let _ = std::fs::create_dir_all(crate::data_dir());
                     open_path(&crate::data_dir());
                 }
+                // verbindt de app niet (na een FM-patch)? Elke stap van de verbinding in diagnose.json,
+                // om mee te sturen met een melding. Op de achtergrond: het doorzoeken duurt enkele seconden.
+                if agent::LIVE_SUPPORTED && theme::button(ui, icon::EXPORT, t!("Diagnose FM-verbinding", "Diagnose FM connection"), true).clicked() {
+                    std::thread::spawn(|| {
+                        let out = match agent::request(json!({"cmd": "diagnose"})) {
+                            Ok(v) => serde_json::to_string_pretty(&v).unwrap_or_default(),
+                            Err(e) => format!("{{\"error\": {:?}}}", format!("{e:#}")),
+                        };
+                        let ping = agent::request(json!({"cmd": "ping"})).map(|v| v.to_string()).unwrap_or_else(|e| format!("{e:#}"));
+                        let _ = std::fs::create_dir_all(crate::data_dir());
+                        let _ = std::fs::write(crate::data_dir().join("diagnose.json"), format!("{out}\n\nping: {ping}\n"));
+                        open_path(&crate::data_dir());
+                    });
+                }
                 if cfg!(target_os = "macos") && theme::button(ui, icon::CAMERA, t!("Schermopname-toestemming", "Screen Recording permission"), true).clicked() {
                     open_path(std::path::Path::new("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"));
                 }

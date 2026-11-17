@@ -710,6 +710,9 @@ struct Market {
     milan_week: u64,
 }
 
+/// Verschuiving van het achterste deel van het financiënblok in `build_market` (normaal 0).
+static FIN_SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Ajax (de menselijke manager) met Wijndal (aanvoerder, ook in de U21-lijst), twee andere spelers
 /// en een speler-trainer; AC Milan met een selectie die nog ruimte heeft; een club met een volle
 /// selectie; AC Milan Women; en de opstellingen van Ajax en van een nationaal team.
@@ -718,14 +721,16 @@ fn build_market(abi: Abi, l: &Layout, base: u64, staff_rva: u64, clubs_rva: u64,
     let mut statics = Heap::new(base + (staff_rva & !0xFFF), 0x2000);
     statics.next = 0x2000;
 
+    // een FM-patch kan het achterste deel van het financiënblok verschuiven (`FIN_SHIFT`)
+    let fs_ = FIN_SHIFT.load(std::sync::atomic::Ordering::Relaxed);
     let finance = |h: &mut Heap, balance: i32, budget: i32| {
         let f = h.alloc(0x900);
         h.put(f + 0x0C, &balance.to_le_bytes());
-        h.put(f + 0x7C4, &budget.to_le_bytes());
-        h.put(f + 0x808, &900_000i32.to_le_bytes());
-        h.put(f + 0x814, &850_000i32.to_le_bytes());
-        h.put(f + 0x864, &45.0f32.to_le_bytes());
-        h.w8(f + 0x8A9, 15);
+        h.put(f + fs_ + 0x7C4, &budget.to_le_bytes());
+        h.put(f + fs_ + 0x808, &900_000i32.to_le_bytes());
+        h.put(f + fs_ + 0x814, &850_000i32.to_le_bytes());
+        h.put(f + fs_ + 0x864, &45.0f32.to_le_bytes());
+        h.w8(f + fs_ + 0x8A9, 15);
         f
     };
     let club = |h: &mut Heap, uid: u32, name: &str, fin: u64, women: u8| {
@@ -1194,4 +1199,79 @@ fn november_builds_are_known() {
         call(json!({"cmd": "allow_untested", "on": true})).unwrap();
         run_market(l, &m);
     }
+}
+
+/// Een FM-patch die objecten verschuift (zoals vermoedelijk de Steam-update van 17 nov 2026): het
+/// contract en het identiteitsblok van de manager liggen 0x18/0x10 verder, het achterste deel van
+/// het financiënblok 0x20, en de clublijst staat niet 0x170 maar 0x1A0 achter de staflijst. De app
+/// vindt de lijsten en de nieuwe plekken zelf, verbindt, leest de juiste waarden, neemt nooit een
+/// speler voor de manager, en schrijft alleen na toestemming, op de verschoven plek.
+#[test]
+fn patch_that_moves_fields_is_calibrated() {
+    let _g = reset(Abi::Msvc);
+    const MOVED: Layout = Layout { staff_contract: 0x1A8 + 0x18, staff_identity: 0x100 + 0x10, ..game::WIN };
+    let base = 0x7FF6_0000_0000u64;
+    let staff_rva = 0x5911858u64;
+    let clubs_rva = staff_rva + 0x1A0;
+    let date_rva = staff_rva - 0x564A0 - 0x40;
+    with(|s| s.images.push(Image { path: "/x/game_plugin.dll".into(), id: Some("PE-7B000000-19100000".into()), start: base, end: base + 0x1900_0000, segments: Vec::new() }));
+    FIN_SHIFT.store(0x20, std::sync::atomic::Ordering::Relaxed);
+    let m = build_market(Abi::Msvc, &MOVED, base, staff_rva, clubs_rva, Some(date_rva));
+    FIN_SHIFT.store(0, std::sync::atomic::Ordering::Relaxed);
+
+    // echte lijsten zijn lang: vul staf- en clublijst aan tot 150 plekken (lege plekken), met een
+    // speler vooraan in de staflijst
+    let list = |rva: u64| -> Vec<u64> {
+        let (b, e) = (mem::u64_at(base + rva).unwrap(), mem::u64_at(base + rva + 8).unwrap());
+        (b..e).step_by(8).map(|a| mem::u64_at(a).unwrap()).collect()
+    };
+    let mut staff = vec![m.wijndal];
+    staff.extend(list(staff_rva));
+    let clubs = list(clubs_rva);
+    let mut pad = Heap::new(0x3_0000_0000, 0x1000);
+    for (rva, items) in [(staff_rva, staff), (clubs_rva, clubs)] {
+        let arr = pad.alloc(150 * 8);
+        for (i, p) in items.iter().enumerate() {
+            pad.w64(arr + i as u64 * 8, *p);
+        }
+        assert!(mem::sys::write_raw(base + rva, &arr.to_le_bytes()));
+        assert!(mem::sys::write_raw(base + rva + 8, &(arr + 150 * 8).to_le_bytes()));
+    }
+    pad.install(true);
+
+    let club = call(json!({"cmd": "club"})).unwrap();
+    assert_eq!(club["name"], "AFC Ajax");
+    let budget = mem::i32_at(m.finance + 0x20 + 0x7C4).unwrap();
+    assert_eq!(club["transfer_budget"], budget, "transferbudget van de verschoven plek");
+    assert_eq!(call(json!({"cmd": "game_date"})).unwrap()["year"], 2027);
+    let ping = call(json!({"cmd": "ping"})).unwrap();
+    assert_eq!(ping["known_build"], false);
+    assert_eq!(ping["statics"], "discovered");
+    assert_eq!(ping["calibration"]["contract"], "0x500");
+    assert_eq!(ping["calibration"]["fin_delta"], 0x20);
+    assert!(!call(json!({"cmd": "squad"})).unwrap().as_array().unwrap().is_empty());
+    let diag = call(json!({"cmd": "diagnose"})).unwrap();
+    assert_eq!(diag["statics"]["clubs"], format!("{clubs_rva:#x}"));
+    assert_eq!(diag["managers"][0]["club"], "AFC Ajax");
+
+    // alleen lezen tot de gebruiker het toestaat; daarna op de verschoven plek, met undo
+    let err = call(json!({"cmd": "set_finances", "transfer_budget": 1})).unwrap_err();
+    assert!(err.contains("tested"), "{err}");
+    call(json!({"cmd": "allow_untested", "on": true})).unwrap();
+    call(json!({"cmd": "set_finances", "transfer_budget": budget as i64 + 1})).unwrap();
+    assert_eq!(mem::i32_at(m.finance + 0x20 + 0x7C4), Some(budget + 1));
+    assert_eq!(mem::i32_at(m.finance + 0x7C4), Some(0), "de oude plek blijft onaangeroerd");
+    call(json!({"cmd": "undo"})).unwrap();
+    assert_eq!(mem::i32_at(m.finance + 0x20 + 0x7C4), Some(budget));
+}
+
+/// Op een bekende build met de bekende indeling wordt niets gekalibreerd.
+#[test]
+fn known_layout_is_not_calibrated() {
+    let _g = reset(Abi::Msvc);
+    let base = 0x7FF6_0000_0000u64;
+    with(|s| s.images.push(Image { path: "/x/game_plugin.dll".into(), id: Some("PE-6AF38E5C-185FA000".into()), start: base, end: base + 0x1900_0000, segments: Vec::new() }));
+    let _m = build_market(Abi::Msvc, &game::WIN, base, 0x5820858, 0x5820858 + 0x170, Some(0x57CA3B8));
+    assert_eq!(call(json!({"cmd": "club"})).unwrap()["name"], "AFC Ajax");
+    assert_eq!(call(json!({"cmd": "ping"})).unwrap()["calibration"], Value::Null);
 }
