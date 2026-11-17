@@ -561,7 +561,50 @@ pub fn diagnose() -> serde_json::Value {
         }
         _ => (json!([]), serde_json::Value::Null),
     };
+    // datum-achtige waarden vóór de staflijst (de spel-datum lag op alle bekende builds 0x21000–0x5F000
+    // ervoor): met de datum die FM toont is de juiste plek daaruit te kiezen
+    let mut dates: Vec<String> = Vec::new();
+    if let Some(st) = st {
+        let from = st.staff.saturating_sub(0x100000).max(img.start);
+        mem::for_each_chunk(from, st.staff, 1 << 20, 0, &mut |a, buf| {
+            for i in (0..buf.len().saturating_sub(4)).step_by(4) {
+                let doy = u16::from_le_bytes([buf[i], buf[i + 1]]);
+                let year = u16::from_le_bytes([buf[i + 2], buf[i + 3]]);
+                if (2024..=2100).contains(&year) && (1..=366).contains(&(doy & 0x1FF)) && dates.len() < 80 {
+                    dates.push(format!("{} {}/{} ({:#06x})", rva(a + i as u64), doy & 0x1FF, year, doy));
+                }
+            }
+        });
+    }
+    // Alle groepen van de staflijst (los van de kalibratie), met de clubs van de leden: de groep van
+    // de echte manager is te herkennen aan zijn club.
+    let staff_groups: Vec<String> = {
+        let clubset: std::collections::HashSet<u64> = club_list.iter().copied().filter(|p| mem::is_ptr(*p)).collect();
+        let groups = people_groups(&staff_list, &clubset);
+        let mut shown: Vec<&PeopleGroup> = groups.iter().take(10).collect();
+        shown.extend(groups.iter().skip(10).filter(|g| g.count <= 40).take(50));
+        shown
+            .into_iter()
+            .map(|g| {
+                let mut clubs: Vec<String> = g
+                    .sample
+                    .iter()
+                    .filter_map(|h| {
+                        let c = mem::u64_at(h + g.contract)?;
+                        club_name(mem::u64_at(mem::u64_at(c + CONTRACT_TEAM)? + TEAM_CLUB)?)
+                    })
+                    .collect();
+                clubs.dedup();
+                clubs.truncate(if g.count <= 40 { 32 } else { 4 });
+                format!("{g} | {}", clubs.join(", "))
+            })
+            .collect()
+    };
+    let club = club().map(|c| json!(c)).unwrap_or_else(|e| json!(e));
     json!({
+        "club": club,
+        "staff_groups": staff_groups,
+        "date_candidates": dates,
         "player_groups": player_groups,
         "squad": squad,
         "build": img.id,
@@ -613,7 +656,15 @@ pub fn reset() {
 /// Mag er op deze build geschreven worden?
 pub(crate) fn writes_allowed() -> Result<(), String> {
     let (id, tested) = build();
-    let tested = tested && with_state(|s| s.calibration).is_none();
+    let cal = with_state(|s| s.calibration);
+    // Plekken uit de groepen (ver van de bekende): op Game Pass 0.9.2524.0 koos die regel de verkeerde
+    // personen (drie andere clubs). Daarop nooit schrijven, ook niet met toestemming.
+    if let Some(c) = cal {
+        if c.contract.abs_diff(nominal_calibration().contract) > CAL_WINDOW {
+            return Err("de manager is op deze FM-versie nog niet zeker gevonden: alleen lezen. / The manager is not reliably found on this FM build yet: read-only.".into());
+        }
+    }
+    let tested = tested && cal.is_none();
     if !tested && !allow_untested() {
         return Err(format!(
             "deze FM-versie ({}) is nog niet getest: alleen lezen. Zet in Instellingen 'Aanpassen op niet-geteste FM-versie' aan om het toch te proberen. / This FM build ({0}) is not verified yet: read-only. Turn on 'Allow changes on an untested FM build' in Settings to try anyway.",
@@ -905,7 +956,7 @@ pub(crate) fn people_groups(list: &[u64], clubs: &std::collections::HashSet<u64>
             let job = mem::u8_at(p + CONTRACT_JOB).unwrap_or(0);
             let g = map.entry((o as u64, owner - obj, job)).or_insert(PeopleGroup { contract: o as u64, identity: owner - obj, job, count: 0, sample: Vec::new() });
             g.count += 1;
-            if g.sample.len() < 8 {
+            if g.sample.len() < 32 {
                 g.sample.push(obj);
             }
         }

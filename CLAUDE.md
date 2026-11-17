@@ -231,6 +231,14 @@ met `expect`), `discover`. Zie `agent/src/lib.rs`.
   verder liggen (de `human_shift`, tot nu toe 0x340). `diagnose` toont de groepen (in `discover_steps`) en
   nu ook `player_groups` (contract/identiteit van de spelers van het eigen team, met de verwachte plekken) en
   `squad`. Test `far_moved_manager_found_from_staff_groups`. Of dit op 0.9.2524.0 werkt: nog niet bekend.
+- Tweede diagnose (0.9.2524.0): de groepsregel koos contract 0x668 / identiteit 0x5C0 (beide +0x180 t.o.v.
+  0x4E8/0x440), `fin_delta` −4, drie "managers" (Eintracht Trier, VfR Garching, IK Start) en de selectie van
+  Trier; **fout**: de gebruiker is manager van Eskişehirspor. Spelers zijn niet verschoven (contract 0x330,
+  identiteit 0x288, 26 spelers, namen/waarden plausibel). De spel-datum werd niet gevonden (1/1/1900 via het
+  team). Daarom: schrijven altijd uit bij een kalibratie ver van de bekende plek (> ±0x40), ook met
+  `allow_untested`; `diagnose` toont nu `staff_groups` (alle groepen met de clubs van de leden, om de groep
+  van de echte manager te herkennen), `date_candidates` (datum-achtige waarden tot 1 MB vóór de staflijst) en
+  het resultaat van `club`.
 - Volgende stap: de melder `diagnose.json` laten sturen (of de build-id uit `ping`), en zodra FMLibreEditor
   een profiel voor de nieuwe build heeft, het in `BUILDS` zetten.
 

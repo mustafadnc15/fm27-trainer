@@ -1327,5 +1327,8 @@ fn far_moved_manager_found_from_staff_groups() {
     assert_eq!(diag["managers"][0]["club"], "AFC Ajax");
     assert!(diag["player_groups"]["groups"].as_array().is_some_and(|g| !g.is_empty()), "{diag}");
     let err = call(json!({"cmd": "set_finances", "transfer_budget": 1})).unwrap_err();
-    assert!(err.contains("tested"), "{err}");
+    assert!(err.contains("read-only"), "{err}");
+    // ook niet met toestemming: deze regel is op een echte save fout gebleken
+    call(json!({"cmd": "allow_untested", "on": true})).unwrap();
+    assert!(call(json!({"cmd": "set_finances", "transfer_budget": 1})).is_err());
 }
