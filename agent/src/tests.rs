@@ -1275,3 +1275,57 @@ fn known_layout_is_not_calibrated() {
     assert_eq!(call(json!({"cmd": "club"})).unwrap()["name"], "AFC Ajax");
     assert_eq!(call(json!({"cmd": "ping"})).unwrap()["calibration"], Value::Null);
 }
+
+/// Zoals Game Pass 0.9.2524.0 (diagnose van een gebruiker, 17 nov 2026): staf- en clublijst gevonden,
+/// maar het managerobject is veel verder verschoven dan het kleine venster van de kalibratie. De
+/// plekken komen dan uit de groepen van de staflijst: gewone staf (grote groep) en de manager met
+/// contract én identiteitsblok even ver verder.
+#[test]
+fn far_moved_manager_found_from_staff_groups() {
+    let _g = reset(Abi::Msvc);
+    const FAR: Layout = Layout { staff_contract: 0x1E8, staff_identity: 0x110, human_shift: 0x3C0, ..game::WIN };
+    let base = 0x7FF6_0000_0000u64;
+    let staff_rva = 0x53FAED0u64;
+    let clubs_rva = staff_rva + 0x170;
+    with(|s| s.images.push(Image { path: "/x/game_plugin.dll".into(), id: Some("PE-6AF5C8C6-179AD000".into()), start: base, end: base + 0x1900_0000, segments: Vec::new() }));
+    let m = build_market(Abi::Msvc, &FAR, base, staff_rva, clubs_rva, Some(staff_rva - 0x5E660));
+
+    let list = |rva: u64| -> Vec<u64> {
+        let (b, e) = (mem::u64_at(base + rva).unwrap(), mem::u64_at(base + rva + 8).unwrap());
+        (b..e).step_by(8).map(|a| mem::u64_at(a).unwrap()).collect()
+    };
+    // gewone staf: contract op 0x1E8, terugwijzend naar 0x110, bij Ajax en Milan
+    let mut pad = Heap::new(0x3_0000_0000, 1 << 20);
+    let mut staff = vec![m.wijndal];
+    for i in 0..60u64 {
+        let o = pad.alloc(0x600);
+        let c = pad.alloc(0x80);
+        pad.w64(o + 0x1E8, c);
+        pad.w64(c + 0x08, o + 0x110);
+        let team = if i % 2 == 0 { m.senior } else { mem::u64_at(m.milan + 0x18).and_then(mem::u64_at).unwrap() };
+        pad.w64(c + 0x10, team);
+        pad.w8(c + 0x26, 3);
+        staff.push(o);
+    }
+    staff.extend(list(staff_rva));
+    let clubs = list(clubs_rva);
+    for (rva, items) in [(staff_rva, staff), (clubs_rva, clubs)] {
+        let arr = pad.alloc(150 * 8);
+        for (i, p) in items.iter().enumerate() {
+            pad.w64(arr + i as u64 * 8, *p);
+        }
+        assert!(mem::sys::write_raw(base + rva, &arr.to_le_bytes()));
+        assert!(mem::sys::write_raw(base + rva + 8, &(arr + 150 * 8).to_le_bytes()));
+    }
+    pad.install(true);
+
+    assert_eq!(call(json!({"cmd": "club"})).unwrap()["name"], "AFC Ajax");
+    let ping = call(json!({"cmd": "ping"})).unwrap();
+    assert_eq!(ping["calibration"]["contract"], "0x5a8");
+    assert_eq!(ping["calibration"]["identity"], "0x4d0");
+    let diag = call(json!({"cmd": "diagnose"})).unwrap();
+    assert_eq!(diag["managers"][0]["club"], "AFC Ajax");
+    assert!(diag["player_groups"]["groups"].as_array().is_some_and(|g| !g.is_empty()), "{diag}");
+    let err = call(json!({"cmd": "set_finances", "transfer_budget": 1})).unwrap_err();
+    assert!(err.contains("tested"), "{err}");
+}

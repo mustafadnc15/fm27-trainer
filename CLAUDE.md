@@ -59,7 +59,7 @@ met `expect`), `discover`. Zie `agent/src/lib.rs`.
 
 - Rust stable met de MSVC-toolchain (`rustup default stable-x86_64-pc-windows-msvc`) en Visual Studio Build Tools
   (workload "Desktop development with C++").
-- `cargo test -p fm27-agent`: 14 tests (draaien sinds 17 nov 2026 ook op Linux, tegen gesimuleerd geheugen), `cargo test -p fm27-trainer`: 3 tests (nagemaakte taartmeters); horen allemaal te slagen.
+- `cargo test -p fm27-agent`: 15 tests (draaien sinds 17 nov 2026 ook op Linux, tegen gesimuleerd geheugen), `cargo test -p fm27-trainer`: 3 tests (nagemaakte taartmeters); horen allemaal te slagen.
 - `cargo run -p fm27-trainer`: de app. `cargo build --release -p fm27-trainer` → `target\release\fm27-trainer.exe`
   (statische C-runtime via `.cargo/config.toml`).
 - **De release-exe heeft geen console** (`windows_subsystem = "windows"`). Gebruik voor de CLI de debug-build:
@@ -221,6 +221,16 @@ met `expect`), `discover`. Zie `agent/src/lib.rs`.
     staf- en clublijst, manager langs elke weg (staflijst, RTTI, managerlijst), kalibratie, datum. In de
     app: Instellingen → "Diagnose FM-verbinding" → `diagnose.json` in de app-map.
   - Tests `patch_that_moves_fields_is_calibrated`, `known_layout_is_not_calibrated`.
+- **Game Pass 0.9.2524.0 = `PE-6AF5C8C6-179AD000`** (diagnose van een gebruiker, 17 nov 2026): `discover` vond
+  clublijst RVA 0x53FB040 (22.680 clubs, namen leesbaar) en 0x170 ervoor de staflijst 0x53FAED0 (32.769), maar
+  geen manager met kloppende keten, ook niet met de kalibratie van ±0x40; RTTI vond 0 vtables van
+  `HUMAN_NON_PLAYER`. Dus: het managerobject is verder verschoven. Daarom **groepen** (`people_groups`,
+  `calibrate_by_groups`): elk object in de staflijst wordt doorzocht (0x800 bytes) op een contract (eigenaar =
+  plek in het object, team → club uit de clublijst), gegroepeerd naar (contract, identiteit, baan). De grootste
+  groep zonder spelers = gewone staf; de manager = een kleine groep waarvan contract én identiteit even ver
+  verder liggen (de `human_shift`, tot nu toe 0x340). `diagnose` toont de groepen (in `discover_steps`) en
+  nu ook `player_groups` (contract/identiteit van de spelers van het eigen team, met de verwachte plekken) en
+  `squad`. Test `far_moved_manager_found_from_staff_groups`. Of dit op 0.9.2524.0 werkt: nog niet bekend.
 - Volgende stap: de melder `diagnose.json` laten sturen (of de build-id uit `ping`), en zodra FMLibreEditor
   een profiel voor de nieuwe build heeft, het in `BUILDS` zetten.
 

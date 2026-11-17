@@ -320,6 +320,21 @@ fn discover_with(img: &mem::Image, note: &mut dyn FnMut(String)) -> Option<Stati
                 chain = staff_list.iter().copied().find_map(check_chain);
             }
         }
+        if chain.is_none() && with_state(|s| s.calibration).is_none() {
+            let clubset: std::collections::HashSet<u64> = club_list.iter().copied().filter(|p| mem::is_ptr(*p)).collect();
+            let groups = people_groups(&staff_list, &clubset);
+            for g in groups.iter().take(10) {
+                note(format!("  groep: {g}"));
+            }
+            match calibrate_by_groups(&groups) {
+                Ok(cal) => {
+                    note(format!("  plekken uit de groepen: {cal:?}"));
+                    with_state(|s| s.calibration = Some(cal));
+                    chain = staff_list.iter().copied().find_map(check_chain);
+                }
+                Err(why) => note(format!("  groepen: {why}")),
+            }
+        }
         let Some(chain) = chain else {
             note("  geen manager met kloppende keten in deze staflijst".into());
             continue;
@@ -530,7 +545,25 @@ pub fn diagnose() -> serde_json::Value {
     let via_rtti = rtti_inst.iter().filter(|h| check_chain(**h).is_some()).count();
     let via_list = humans_via_manager_list(&img).len();
     let humans = humans();
+    // spelers van het eigen team: waar hun contract staat (verschuift de indeling van spelers mee?)
+    // en wat de selectie dan oplevert
+    let (player_groups, squad) = match &humans {
+        Ok(v) if !v.is_empty() => {
+            let team = v[0].team;
+            let players: Vec<u64> = pointer_list(team + TEAM_PLAYERS, 400).map(|(_, p)| p).unwrap_or_default();
+            let clubset: std::collections::HashSet<u64> = club_list.iter().copied().filter(|p| mem::is_ptr(*p)).chain([v[0].club]).collect();
+            let groups: Vec<String> = people_groups(&players, &clubset).iter().take(6).map(|g| g.to_string()).collect();
+            let sq = match squad() {
+                Ok(s) => json!({"players": s.len(), "first": s.iter().take(3).map(|p| json!(p)).collect::<Vec<_>>()}),
+                Err(e) => json!(e),
+            };
+            (json!({"team_players": players.len(), "groups": groups, "expected_contract": format!("{:#x}", layout().p_contract), "expected_identity": format!("{:#x}", layout().p_identity)}), sq)
+        }
+        _ => (json!([]), serde_json::Value::Null),
+    };
     json!({
+        "player_groups": player_groups,
+        "squad": squad,
         "build": img.id,
         "build_label": prof.map(|b| b.label),
         "image_size": format!("{:#x}", img.end - img.start),
@@ -822,6 +855,100 @@ fn humans_via_manager_list(img: &mem::Image) -> Vec<Chain> {
         }
     }
     Vec::new()
+}
+
+/// Personen in een lijst, gegroepeerd naar de plek van hun contract en van het identiteitsblok
+/// waar dat contract naar terugwijst. Gevonden zonder iets over de indeling aan te nemen: elk woord
+/// in de eerste `PEOPLE_SCAN` bytes van het object dat naar een contract wijst (eigenaar = een plek in
+/// het object, team → club uit `clubs`).
+#[derive(Clone, Debug)]
+pub(crate) struct PeopleGroup {
+    pub contract: u64,
+    pub identity: u64,
+    /// u8 soort baan uit het contract (1 = speler)
+    pub job: u8,
+    pub count: usize,
+    pub sample: Vec<u64>,
+}
+
+impl std::fmt::Display for PeopleGroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let fin = self.sample.first().and_then(|h| {
+            let c = mem::u64_at(h + self.contract)?;
+            let club = mem::u64_at(mem::u64_at(c + CONTRACT_TEAM)? + TEAM_CLUB)?;
+            let finance = mem::u64_at(club + CLUB_FINANCE).filter(|f| mem::is_ptr(*f))?;
+            Some(fin_delta(finance).map_or("financiën ?".to_string(), |d| format!("financiën {d:+#x}")))
+        });
+        write!(f, "contract {:#x}, identiteit {:#x}, baan {}, {} personen, {}", self.contract, self.identity, self.job, self.count, fin.unwrap_or_else(|| "-".into()))
+    }
+}
+
+const PEOPLE_SCAN: usize = 0x800;
+
+pub(crate) fn people_groups(list: &[u64], clubs: &std::collections::HashSet<u64>) -> Vec<PeopleGroup> {
+    let mut map: std::collections::HashMap<(u64, u64, u8), PeopleGroup> = std::collections::HashMap::new();
+    for &obj in list.iter().filter(|p| mem::is_ptr(**p)) {
+        let Some(bytes) = mem::read_bytes(obj, PEOPLE_SCAN) else { continue };
+        for o in (0..PEOPLE_SCAN).step_by(8) {
+            let p = u64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
+            if !mem::is_ptr(p) {
+                continue;
+            }
+            let Some(owner) = mem::u64_at(p + CONTRACT_OWNER) else { continue };
+            if owner < obj || owner >= obj + PEOPLE_SCAN as u64 || (owner - obj) % 4 != 0 {
+                continue;
+            }
+            let Some(team) = mem::u64_at(p + CONTRACT_TEAM).filter(|t| mem::is_ptr(*t)) else { continue };
+            if !mem::u64_at(team + TEAM_CLUB).is_some_and(|c| clubs.contains(&c)) {
+                continue;
+            }
+            let job = mem::u8_at(p + CONTRACT_JOB).unwrap_or(0);
+            let g = map.entry((o as u64, owner - obj, job)).or_insert(PeopleGroup { contract: o as u64, identity: owner - obj, job, count: 0, sample: Vec::new() });
+            g.count += 1;
+            if g.sample.len() < 8 {
+                g.sample.push(obj);
+            }
+        }
+    }
+    let mut v: Vec<PeopleGroup> = map.into_values().collect();
+    v.sort_by(|a, b| b.count.cmp(&a.count).then(a.contract.cmp(&b.contract)));
+    v
+}
+
+/// De kleinste verschuiving van het achterste deel van het financiënblok waarbij het klopt.
+fn fin_delta(finance: u64) -> Option<i64> {
+    let mut deltas: Vec<i64> = (-CAL_FIN_WINDOW / 4..=CAL_FIN_WINDOW / 4).map(|d| d * 4).collect();
+    deltas.sort_by_key(|d| d.abs());
+    deltas.into_iter().find(|d| finance_fits(finance, *d))
+}
+
+/// Plekken van de manager uit de groepen van de staflijst. De grootste groep zonder spelers is de
+/// gewone staf; een menselijke manager is een staflid met een stuk ervoor (`human_shift`, tot nu
+/// toe 0x340): zijn contract én identiteitsblok liggen dus allebei even ver verder dan bij de gewone
+/// staf. Van zulke groepen de kleinste (er zijn maar een paar menselijke managers), met een club
+/// met naam en financiën.
+fn calibrate_by_groups(groups: &[PeopleGroup]) -> Result<Calibration, String> {
+    let staff = groups.iter().filter(|g| g.job != 1).max_by_key(|g| g.count).ok_or("geen staf gevonden")?;
+    let mut humans: Vec<&PeopleGroup> = groups
+        .iter()
+        .filter(|g| g.job != 1 && g.contract > staff.contract && g.contract - staff.contract == g.identity.wrapping_sub(staff.identity) && g.count * 20 <= staff.count.max(20))
+        .collect();
+    humans.sort_by_key(|g| (g.count, g.contract));
+    for g in humans {
+        for &h in &g.sample {
+            let Some(c) = mem::u64_at(h + g.contract) else { continue };
+            let Some(club) = mem::u64_at(c + CONTRACT_TEAM).and_then(|t| mem::u64_at(t + TEAM_CLUB)) else { continue };
+            if club_name(club).is_none() {
+                continue;
+            }
+            let Some(finance) = mem::u64_at(club + CLUB_FINANCE).filter(|f| mem::is_ptr(*f)) else { continue };
+            if let Some(fin_delta) = fin_delta(finance) {
+                return Ok(Calibration { contract: g.contract, identity: g.identity, fin_delta });
+            }
+            return Err(format!("manager-groep {g}: financiën van de club passen niet"));
+        }
+    }
+    Err(format!("geen manager-groep (staf: {staff})"))
 }
 
 /// Objecten die een menselijke manager kunnen zijn, zonder de keten te controleren: de exemplaren
