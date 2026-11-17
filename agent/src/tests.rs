@@ -724,7 +724,7 @@ fn build_market(abi: Abi, l: &Layout, base: u64, staff_rva: u64, clubs_rva: u64,
     // een FM-patch kan het achterste deel van het financiënblok verschuiven (`FIN_SHIFT`)
     let fs_ = FIN_SHIFT.load(std::sync::atomic::Ordering::Relaxed);
     let finance = |h: &mut Heap, balance: i32, budget: i32| {
-        let f = h.alloc(0x900);
+        let f = h.alloc(0xA00);
         h.put(f + 0x0C, &balance.to_le_bytes());
         h.put(f + fs_ + 0x7C4, &budget.to_le_bytes());
         h.put(f + fs_ + 0x808, &900_000i32.to_le_bytes());
@@ -1276,8 +1276,8 @@ fn known_layout_is_not_calibrated() {
     assert_eq!(call(json!({"cmd": "ping"})).unwrap()["calibration"], Value::Null);
 }
 
-/// Zoals Game Pass 0.9.2524.0 (diagnose van een gebruiker, 17 nov 2026): staf- en clublijst gevonden,
-/// maar het managerobject is veel verder verschoven dan het kleine venster van de kalibratie. De
+/// Een build waarop het managerobject veel verder verschoven is dan het kleine venster van de
+/// kalibratie (eerst vermoed voor Game Pass 0.9.2524.0; daar bleek het de financiën te zijn). De
 /// plekken komen dan uit de groepen van de staflijst: gewone staf (grote groep) en de manager met
 /// contract én identiteitsblok even ver verder.
 #[test]
@@ -1287,7 +1287,7 @@ fn far_moved_manager_found_from_staff_groups() {
     let base = 0x7FF6_0000_0000u64;
     let staff_rva = 0x53FAED0u64;
     let clubs_rva = staff_rva + 0x170;
-    with(|s| s.images.push(Image { path: "/x/game_plugin.dll".into(), id: Some("PE-6AF5C8C6-179AD000".into()), start: base, end: base + 0x1900_0000, segments: Vec::new() }));
+    with(|s| s.images.push(Image { path: "/x/game_plugin.dll".into(), id: Some("PE-7C000000-17000000".into()), start: base, end: base + 0x1900_0000, segments: Vec::new() }));
     let m = build_market(Abi::Msvc, &FAR, base, staff_rva, clubs_rva, Some(staff_rva - 0x5E660));
 
     let list = |rva: u64| -> Vec<u64> {
@@ -1331,4 +1331,40 @@ fn far_moved_manager_found_from_staff_groups() {
     // ook niet met toestemming: deze regel is op een echte save fout gebleken
     call(json!({"cmd": "allow_untested", "on": true})).unwrap();
     assert!(call(json!({"cmd": "set_finances", "transfer_budget": 1})).is_err());
+}
+
+/// Game Pass 0.9.2524.0 zoals gemeten bij een gebruiker (17 nov 2026): de manager staat op de bekende
+/// plekken, maar de budgetten in het financiënblok liggen bij de meeste clubs 0x64 verder, en de club
+/// van de gebruiker zelf heeft bedragen die ook daar niet door de controle komen (hier: een negatief
+/// transferbudget). De app moet tóch die manager nemen (niet een andere club), de datum van de
+/// vaste plek lezen en de budgetten op +0x64 vinden.
+#[test]
+fn game_pass_2524_finance_moved() {
+    let _g = reset(Abi::Msvc);
+    let base = 0x7FF6_0000_0000u64;
+    let (staff_rva, clubs_rva, date_rva) = (0x53FAED0u64, 0x53FB040u64, 0x539DD10u64);
+    with(|s| s.images.push(Image { path: "/x/game_plugin.dll".into(), id: Some("PE-6AF5C8C6-179AD000".into()), start: base, end: base + 0x1900_0000, segments: Vec::new() }));
+    FIN_SHIFT.store(0x64, std::sync::atomic::Ordering::Relaxed);
+    let m = build_market(Abi::Msvc, &game::WIN, base, staff_rva, clubs_rva, Some(date_rva));
+    FIN_SHIFT.store(0, std::sync::atomic::Ordering::Relaxed);
+    assert!(mem::sys::write_raw(m.finance + 0x64 + 0x7C4, &(-5_000_000i32).to_le_bytes()));
+    assert!(mem::sys::write_raw(base + date_rva, &date_bytes(2026, 364)));
+
+    let club = call(json!({"cmd": "club"})).unwrap();
+    assert_eq!(club["name"], "AFC Ajax");
+    assert_eq!(club["transfer_budget"], -5_000_000);
+    assert_eq!(call(json!({"cmd": "game_date"})).unwrap(), json!({"year": 2026, "doy": 364}));
+    let ping = call(json!({"cmd": "ping"})).unwrap();
+    assert_eq!(ping["statics"], "profile");
+    assert_eq!(ping["build_label"], "Game Pass 0.9.2524.0 Windows");
+    assert_eq!(ping["calibration"]["fin_delta"], 0x64);
+    assert_eq!(ping["calibration"]["fin_ok"], true);
+    assert_eq!(ping["calibration"]["contract"], "0x4e8", "de manager staat op de bekende plek");
+    // alleen lezen tot de gebruiker het toestaat; dan op de verschoven plek, met undo
+    assert!(call(json!({"cmd": "set_finances", "transfer_budget": 1})).is_err());
+    call(json!({"cmd": "allow_untested", "on": true})).unwrap();
+    call(json!({"cmd": "set_finances", "transfer_budget": 1_000_000})).unwrap();
+    assert_eq!(mem::i32_at(m.finance + 0x64 + 0x7C4), Some(1_000_000));
+    call(json!({"cmd": "undo"})).unwrap();
+    assert_eq!(mem::i32_at(m.finance + 0x64 + 0x7C4), Some(-5_000_000));
 }

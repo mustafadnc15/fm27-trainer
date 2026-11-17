@@ -59,7 +59,7 @@ met `expect`), `discover`. Zie `agent/src/lib.rs`.
 
 - Rust stable met de MSVC-toolchain (`rustup default stable-x86_64-pc-windows-msvc`) en Visual Studio Build Tools
   (workload "Desktop development with C++").
-- `cargo test -p fm27-agent`: 15 tests (draaien sinds 17 nov 2026 ook op Linux, tegen gesimuleerd geheugen), `cargo test -p fm27-trainer`: 3 tests (nagemaakte taartmeters); horen allemaal te slagen.
+- `cargo test -p fm27-agent`: 16 tests (draaien sinds 17 nov 2026 ook op Linux, tegen gesimuleerd geheugen), `cargo test -p fm27-trainer`: 3 tests (nagemaakte taartmeters); horen allemaal te slagen.
 - `cargo run -p fm27-trainer`: de app. `cargo build --release -p fm27-trainer` → `target\release\fm27-trainer.exe`
   (statische C-runtime via `.cargo/config.toml`).
 - **De release-exe heeft geen console** (`windows_subsystem = "windows"`). Gebruik voor de CLI de debug-build:
@@ -239,6 +239,15 @@ met `expect`), `discover`. Zie `agent/src/lib.rs`.
   `allow_untested`; `diagnose` toont nu `staff_groups` (alle groepen met de clubs van de leden, om de groep
   van de echte manager te herkennen), `date_candidates` (datum-achtige waarden tot 1 MB vóór de staflijst) en
   het resultaat van `club`.
+- Derde diagnose (0.9.2524.0, Eskişehirspor, FM-datum 30-12-2026): `staff_groups` toonde de echte manager op
+  de **bekende** plekken (contract 0x4E8 / identiteit 0x440, één persoon, Eskişehirspor Kulübü). Hij viel af op
+  `finance_looks_real`: de budgetten liggen bij de meeste clubs 0x64 verder, en die van Eskişehirspor kwamen
+  ook daar niet door de controle. Datum: `0x539DD10` = 364/2026. Staf in drie kopieën (contract 0x1A8/0x3E8/0x628).
+  Opgelost (simulatie, test `game_pass_2524_finance_moved`): de keten controleert geen bedragen meer (alleen
+  contract ↔ identiteit, team, club met naam, financiën-pointer); `ensure_fin` kiest de verschuiving van de
+  budgetten die bij de meeste clubs uit de clublijst klopt (±0x100), anders `fin_ok: false` en dan geen
+  budget-/geldwijzigingen (`fin_known`). Profiel `PE-6AF5C8C6-179AD000` in `BUILDS` (staf 0x53FAED0, clubs
+  0x53FB040, datum 0x539DD10, alleen lezen). Het saldo (+0x0C) wordt onverschoven gelezen: niet gecontroleerd.
 - Volgende stap: de melder `diagnose.json` laten sturen (of de build-id uit `ping`), en zodra FMLibreEditor
   een profiel voor de nieuwe build heeft, het in `BUILDS` zetten.
 

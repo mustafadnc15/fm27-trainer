@@ -513,6 +513,9 @@ fn relocate(purchase: bool, uid: u32, other_uid: u32, fee: i64, wage: Option<i64
     // geld. Verkopen: de koper betaalt (saldo en transferbudget, niet onder nul), jij ontvangt de
     // som op je saldo én in je transferbudget (FM zelf maakt het deel vrij dat het bestuur
     // toestaat; de app alles, bijstellen kan op de clubpagina). Kopen: andersom.
+    if fee != 0 {
+        game::fin_known()?;
+    }
     let balance = mem::i32_at(game::fin(chain.finance, FIN_BALANCE)).unwrap_or(0) as i64;
     let transfer_budget = mem::i32_at(game::fin(chain.finance, FIN_TRANSFER)).unwrap_or(0).max(0) as i64;
     let mut deltas = Vec::new();

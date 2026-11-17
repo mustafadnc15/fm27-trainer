@@ -188,6 +188,10 @@ pub const BUILDS: &[Build] = &[
     Build { id: "A8550B47-FDE0-3D0D-A6CB-1B63DEE8DA19", label: "Steam 26577676 macOS arm64", writes_tested: true, current_date: 0x574DDB8, staff: 0x576EE98, clubs: 0x576F008 },
     Build { id: "PE-6AE8B5A4-17CB9000", label: "Steam 26385295 Windows", writes_tested: true, current_date: 0x57CA3B8, staff: 0x5820858, clubs: 0x58209C8 },
     Build { id: "PE-6AF38E5C-185FA000", label: "Steam 26577676 Windows", writes_tested: true, current_date: 0x57CA3B8, staff: 0x5820858, clubs: 0x58209C8 },
+    // Game Pass 0.9.2524.0 (update van 17 nov 2026): niet in FMLibreEditor; gemeten met `diagnose` bij een
+    // gebruiker (Eskişehirspor-save, 30-12-2026): staf- en clublijst gevonden door `discover`, de datum op
+    // 0x539DD10 (dag 364 van 2026, gelijk aan FM). Budgetten verschoven (zie `ensure_fin`). Alleen lezen.
+    Build { id: "PE-6AF5C8C6-179AD000", label: "Game Pass 0.9.2524.0 Windows", writes_tested: false, current_date: 0x539DD10, staff: 0x53FAED0, clubs: 0x53FB040 },
     Build { id: "PE-6AE8CF77-17969000", label: "Game Pass 0.9.2435.0 Windows", writes_tested: true, current_date: 0x53597C8, staff: 0x53B7E28, clubs: 0x53B7F98 },
     // Intel-helft van de Mac-versie (Intel-Macs, of Apple silicon onder Rosetta): nooit door dit project getest
     Build { id: "0981AB31-AC3B-3D93-944F-47FE4B59CD9E", label: "Steam 26340721 macOS Intel", writes_tested: false, current_date: 0x5C69700, staff: 0x5C89210, clubs: 0x5C89380 },
@@ -444,6 +448,8 @@ struct State {
     calibration: Option<Calibration>,
     /// laatste vergeefse kalibratie: niet bij elke verbindingscontrole opnieuw (zonder save is er niets)
     calibrate_failed: Option<std::time::Instant>,
+    /// `ensure_fin` is gedaan
+    fin_checked: bool,
 }
 
 /// De plekken die de keten manager → contract → team → club → financiën gebruikt. Normaal uit
@@ -456,11 +462,13 @@ pub(crate) struct Calibration {
     pub identity: u64,
     /// verschuiving van het achterste deel van het financiënblok
     pub fin_delta: i64,
+    /// de plek van de budgetten is zeker (anders: budgetten niet aanpassen)
+    pub fin_ok: bool,
 }
 
 fn nominal_calibration() -> Calibration {
     let l = layout();
-    Calibration { contract: l.staff_contract + l.human_shift, identity: l.staff_identity + l.human_shift, fin_delta: 0 }
+    Calibration { contract: l.staff_contract + l.human_shift, identity: l.staff_identity + l.human_shift, fin_delta: 0, fin_ok: true }
 }
 
 pub(crate) fn calibration() -> Calibration {
@@ -472,7 +480,7 @@ pub fn calibrated() -> Option<serde_json::Value> {
     let c = with_state(|s| s.calibration)?;
     let n = nominal_calibration();
     Some(serde_json::json!({
-        "contract": format!("{:#x}", c.contract), "identity": format!("{:#x}", c.identity), "fin_delta": c.fin_delta,
+        "contract": format!("{:#x}", c.contract), "identity": format!("{:#x}", c.identity), "fin_delta": c.fin_delta, "fin_ok": c.fin_ok,
         "nominal_contract": format!("{:#x}", n.contract), "nominal_identity": format!("{:#x}", n.identity),
     }))
 }
@@ -763,11 +771,14 @@ fn check_chain_with(h: u64, cal: &Calibration) -> Option<Chain> {
         return None;
     }
     let club = mem::u64_at(team + TEAM_CLUB)?;
-    if !mem::is_ptr(club) {
+    if !mem::is_ptr(club) || club_name(club).is_none() {
         return None;
     }
+    // De bedragen in het financiënblok tellen hier niet mee: op Game Pass 0.9.2524.0 is dat blok
+    // verschoven en had de club van de gebruiker (Eskişehirspor) waarden die er niet door kwamen,
+    // waardoor de echte manager werd afgewezen. Waar de budgetten staan, bepaalt `ensure_fin`.
     let finance = mem::u64_at(club + CLUB_FINANCE)?;
-    if !mem::is_ptr(finance) || !finance_fits(finance, cal.fin_delta) {
+    if !mem::is_ptr(finance) {
         return None;
     }
     Some(Chain { human: h, contract, team, club, finance })
@@ -809,12 +820,11 @@ fn calibrate(cands: &[u64]) -> Option<Calibration> {
             if club_name(club).is_none() || !mem::u32_at(club + CLUB_UID).is_some_and(|u| u != 0) {
                 continue;
             }
-            let Some(finance) = mem::u64_at(club + CLUB_FINANCE).filter(|f| mem::is_ptr(*f)) else { continue };
-            let mut deltas: Vec<i64> = (-CAL_FIN_WINDOW / 4..=CAL_FIN_WINDOW / 4).map(|d| d * 4).collect();
-            deltas.sort_by_key(|d| d.abs());
-            if let Some(fin_delta) = deltas.into_iter().find(|d| finance_fits(finance, *d)) {
-                return Some(Calibration { contract: o, identity, fin_delta });
+            if !mem::u64_at(club + CLUB_FINANCE).is_some_and(mem::is_ptr) {
+                continue;
             }
+            // de budgetten zoekt `ensure_fin` daarna, over alle clubs
+            return Some(Calibration { contract: o, identity, fin_delta: 0, fin_ok: false });
         }
     }
     None
@@ -994,7 +1004,7 @@ fn calibrate_by_groups(groups: &[PeopleGroup]) -> Result<Calibration, String> {
             }
             let Some(finance) = mem::u64_at(club + CLUB_FINANCE).filter(|f| mem::is_ptr(*f)) else { continue };
             if let Some(fin_delta) = fin_delta(finance) {
-                return Ok(Calibration { contract: g.contract, identity: g.identity, fin_delta });
+                return Ok(Calibration { contract: g.contract, identity: g.identity, fin_delta, fin_ok: false });
             }
             return Err(format!("manager-groep {g}: financiën van de club passen niet"));
         }
@@ -1058,7 +1068,61 @@ fn humans() -> Result<Vec<Chain>, String> {
     if found.is_empty() {
         return Err("geen menselijke manager met club gevonden. Is er een save geladen? / No human manager with a club found. Is a save loaded?".into());
     }
+    ensure_fin(&img, &found);
     Ok(found)
+}
+
+/// Hoe ver de budgetten in het financiënblok mogen zijn verschoven.
+const FIN_SEARCH: i64 = 0x100;
+
+/// Bepaalt (één keer) waar in het financiënblok de budgetten staan. Klopt de bekende plek voor de
+/// club van een manager, dan blijft alles zoals het is. Anders telt de verschuiving die bij de
+/// meeste clubs uit de clublijst klopt (één club kan afwijkende bedragen hebben, zoals een
+/// negatief transferbudget); gemeten op Game Pass 0.9.2524.0: bij de meeste clubs +0x64.
+fn ensure_fin(img: &mem::Image, found: &[Chain]) {
+    let cal = calibration();
+    if with_state(|s| s.fin_checked) {
+        return;
+    }
+    with_state(|s| s.fin_checked = true);
+    if found.iter().any(|c| finance_fits(c.finance, cal.fin_delta)) && cal.fin_ok {
+        return;
+    }
+    let clubs: Vec<u64> = statics(img).and_then(|st| read_ptr_list(st.clubs)).unwrap_or_default();
+    let finances: Vec<u64> = clubs
+        .iter()
+        .filter(|c| mem::is_ptr(**c))
+        .filter_map(|c| mem::u64_at(c + CLUB_FINANCE).filter(|f| mem::is_ptr(*f)))
+        .take(400)
+        .collect();
+    let mut best: Option<(usize, i64)> = None;
+    for d in (-FIN_SEARCH / 4..=FIN_SEARCH / 4).map(|d| d * 4) {
+        let n = finances.iter().filter(|f| finance_fits(**f, d)).count();
+        let better = match best {
+            None => n > 0,
+            Some((bn, bd)) => n > bn || (n == bn && d.abs() < bd.abs()),
+        };
+        if better {
+            best = Some((n, d));
+        }
+    }
+    let new = match best {
+        // de meerderheid van de clubs, en minstens twee
+        Some((n, d)) if n >= 2 && n * 2 >= finances.len() => Calibration { fin_delta: d, fin_ok: true, ..cal },
+        _ => Calibration { fin_ok: false, ..cal },
+    };
+    if new != nominal_calibration() || with_state(|s| s.calibration).is_some() {
+        with_state(|s| s.calibration = Some(new));
+    }
+}
+
+/// Mogen de budgetten aangepast worden? Niet als hun plek in het financiënblok niet zeker is.
+pub(crate) fn fin_known() -> Result<(), String> {
+    if calibration().fin_ok {
+        Ok(())
+    } else {
+        Err("de plek van de budgetten is op deze FM-versie niet zeker: budgetten niet aanpassen. / The budget fields are not reliably located on this FM build: not changing budgets.".into())
+    }
 }
 
 /// Vindt (en onthoudt) de menselijke manager: die van de gekozen club als de gebruiker er een
@@ -1197,6 +1261,7 @@ fn i32_patch(addr: u64, new: i32) -> Result<Patch, String> {
 
 pub fn set_finances(transfer: Option<i64>, wage: Option<i64>, balance: Option<i64>) -> Result<ClubInfo, String> {
     let c = chain()?;
+    fin_known()?;
     let clamp = |v: i64| v.clamp(0, i32::MAX as i64) as i32;
     let mut patches = Vec::new();
     if let Some(t) = transfer {
