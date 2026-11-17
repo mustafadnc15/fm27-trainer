@@ -248,6 +248,11 @@ met `expect`), `discover`. Zie `agent/src/lib.rs`.
   budgetten die bij de meeste clubs uit de clublijst klopt (±0x100), anders `fin_ok: false` en dan geen
   budget-/geldwijzigingen (`fin_known`). Profiel `PE-6AF5C8C6-179AD000` in `BUILDS` (staf 0x53FAED0, clubs
   0x53FB040, datum 0x539DD10, alleen lezen). Het saldo (+0x0C) wordt onverschoven gelezen: niet gecontroleerd.
+- **Live bevestigd door de gebruiker** (Game Pass 0.9.2524.0, Eskişehirspor, 17 nov 2026, build `de1b9ad`):
+  club, selectie (24), datum 30-12-2026 kloppen met FM; moraal (`inspire`) en training (`set_week`) schrijven
+  werkt, elk met undo. Budgetten: `ensure_fin` vond geen meerderheid (`fin_ok: false`), gelezen op de oude plekken
+  (saldo 23.201, transfer 0, loon 16.971 / 17.170 pond): vermoedelijk onverschoven (alleen ticketprijs/corporate
+  verschoven?), **niet bevestigd**; budgetwijzigingen blijven geblokkeerd. De gebruiker heeft budgetten niet nodig.
 - Volgende stap: de melder `diagnose.json` laten sturen (of de build-id uit `ping`), en zodra FMLibreEditor
   een profiel voor de nieuwe build heeft, het in `BUILDS` zetten.
 
