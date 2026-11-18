@@ -244,7 +244,7 @@ met `expect`), `discover`. Zie `agent/src/lib.rs`.
   undo) en een plannertest. **Niet live getest**: of FM voor een jeugd- of B-team een eigen weeklijst bijhoudt,
   is niet gemeten. Er is één set uitgelezen waarden; die wordt niet per team bewaard.
 
-## Twee trainers: eerste elftal en jeugdteam (19 nov 2026, fork, nog niet gebouwd)
+## Twee trainers: eerste elftal en jeugdteam (19 nov 2026, fork, gebouwd in CI)
 
 - Overzicht, Training, Planning en Instellingen → Planner hebben een schakelaar Eerste elftal / Jeugdteam
   (`TeamSlot` in `app/src/live.rs`, `App.slot`). Per trainer: eigen meting (`effectiveness.json` /
@@ -256,7 +256,7 @@ met `expect`), `discover`. Zie `agent/src/lib.rs`.
 - Module: `training_weeks`/`set_week` nemen optioneel `"team"` (plek in de teamlijst of `"own"`), dat gaat vóór
   de keuze van `select` (`TeamPick` in `game.rs`, test in `run_market`). De app stuurt het altijd mee en zet voor
   de jeugdronde ook `select` om en terug (voor een oudere Mac-module zonder `"team"`).
-- Geschreven zonder compiler (geen Rust op deze pc): eerst `cargo test` en `cargo build`. Niet live getest.
+- Geschreven zonder compiler (geen Rust op deze pc); CI-run #8 (`cargo test -p fm27-agent` + release-build) groen. App-tests niet gedraaid, niet live getest.
 
 ## Intel-Mac start niet (GitHub #5, 16 nov 2026, uitgebracht in 0.2.7)
 
