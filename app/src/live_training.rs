@@ -100,8 +100,15 @@ fn kind_for(start: NaiveDate) -> WeekKind {
 /// geplande sessies op (en een beetje verval voor wat niet getraind is), zodat de focus over de weken
 /// meeschuift in plaats van elke week dezelfde drie gebieden te trainen. Rustweken ("Full Week of
 /// Rest") blijven van FM.
-pub fn run(eff: &Effectiveness, settings: &PlannerSettings, write: bool, skip: &HashSet<NaiveDate>) -> Result<Outcome> {
-    let data = agent::request(json!({"cmd": "training_weeks"})).context("training calendar")?;
+///
+/// `team` gaat mee met elke opdracht (`"own"`, een plek in de teamlijst, of `Value::Null` voor de
+/// keuze van `select`), zodat lezen en schrijven altijd over hetzelfde team gaan.
+pub fn run(eff: &Effectiveness, settings: &PlannerSettings, write: bool, skip: &HashSet<NaiveDate>, team: &Value) -> Result<Outcome> {
+    let mut req = json!({"cmd": "training_weeks"});
+    if !team.is_null() {
+        req["team"] = team.clone();
+    }
+    let data = agent::request(req).context("training calendar")?;
     let today = fm_date(&data["today"]).context("game date")?;
     let weeks: Vec<(NaiveDate, Vec<[u16; 3]>, String)> = data["weeks"]
         .as_array()
