@@ -167,6 +167,14 @@ in a save (for example day `[200, 3, 7]` = Individual Development / In Possessio
   `2` int, `1` bool), and the high nibble is an inline count/length/value plus one, or 0 when a u32 follows. Inline
   ints are `n - 8`. See `tools/jsb.py`.
 
+- Shared training schedules (`.fmf` exported from FM27's training screen) are the same archive, `afe.` variant,
+  with three files: `<name>.tsc`, `_data/details.aom` (schedule name, author) and `image.img`. The `.tsc` starts
+  with `03 01 "cst."` and 7 header bytes; from byte 13 come 7 days of `[u8 4, u16 session 1, u16 session 2,
+  u16 extra, u8 0]` in FM27's session codes (the table above), then a u32-length description and 8 zero bytes.
+  Measured on five shared schedules (November 2026); none contained a match day. Day 1 is taken as Monday (not
+  checked against FM's schedule screen). Read by `app/src/fmf.rs`; imported schedules are applied by
+  `app/src/custom.rs` (see "Custom schedules" in the README).
+
 ## Screen reading
 
 Reading is independent of the screen size and FM's UI scale: the capture is analysed at its own size and, when

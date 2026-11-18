@@ -150,6 +150,9 @@ pub struct PlannerSettings {
     /// wie het tactisch begrip al op 100 % laat houden ("Op 100 % houden" op de Selectie-pagina).
     #[serde(default)]
     pub no_tactical: bool,
+    /// Eigen weekschema's en welke weken ze krijgen (live in FM).
+    #[serde(default)]
+    pub custom: crate::custom::CustomTraining,
 }
 
 fn default_block() -> u32 {
@@ -158,7 +161,7 @@ fn default_block() -> u32 {
 
 impl Default for PlannerSettings {
     fn default() -> Self {
-        PlannerSettings { bonding_below: 60.0, set_pieces_every: 0, gain_per_session: 2.2, decay_per_week: 0.8, replan_every_weeks: 4, load: Load::Balanced, no_tactical: false }
+        PlannerSettings { bonding_below: 60.0, set_pieces_every: 0, gain_per_session: 2.2, decay_per_week: 0.8, replan_every_weeks: 4, load: Load::Balanced, no_tactical: false, custom: Default::default() }
     }
 }
 

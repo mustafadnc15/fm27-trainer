@@ -493,3 +493,21 @@ FM27 gebruikt nepnamen voor clubs zonder licentie: AC Milan = **Casciavit Milano
   `.github/FUNDING.yml`, de README ("Support"), de sortitoutsi-post (kopje "Support" boven "Credits") en in de app
   (Instellingen → "Steun de ontwikkeling", `DONATE_URL` in `app/src/gui.rs`; komt mee in de versie ná 0.2.8).
   In sortitoutsi's voorwaarden stond niets over donatielinks.
+
+## Eigen schema's en gedeelde .fmf-schema's (18 nov 2026, fork)
+
+- Training-pagina → "Eigen schema's": `.fmf` importeren (bestandskiezer `rfd` of slepen op het venster), zelf maken,
+  of een komende week "Bewaar als schema". Toewijzen: standaard voor alle weken, N weken vanaf deze week, of per
+  week (keuzelijst op de weekkaart), of een herhalend patroon (`pattern`, `pattern_start`, `pattern_on`:
+  week n na het begin krijgt `pattern[n % len]`). Voorrang: eigen keuze van de week > patroon > standaard >
+  automatische planner (`CustomTraining::source`). Opgeslagen in `PlannerSettings.custom` (`app/src/custom.rs`), toegepast in
+  `live_training::run` via `custom::apply`: alleen bewerkbare dagen, wedstrijd/reis blijft van FM, `None` = FM's
+  sessie laten staan, `follow_match_rhythm` = dagen rond wedstrijden van de planner (aan voor nieuwe, uit voor
+  geïmporteerde schema's). Een expliciet toegewezen schema geldt ook in een rustweek.
+- `.fmf`-schema = SI-archief (`afe.`) met `<naam>.tsc`, `_data/details.aom`, `image.img`; `.tsc`-indeling in
+  docs/TECHNICAL.md, lezer in `app/src/fmf.rs` (puur Rust: `aes`/`ctr`/`ruzstd`). Gemeten op vijf gedeelde
+  schema's van de gebruiker (C1–C4 min+24TE, u18 C1): alles gelezen, geen onbekende codes. Testen met echte
+  bestanden: `FM27_FMF_SAMPLES=<map> cargo test -p fm27-trainer fmf`.
+- **Niet live in FM getest.** Dag 1 = maandag is een aanname. Op Linux bouwen kan alleen met
+  `--features eframe/x11` (geen doelplatform).
+

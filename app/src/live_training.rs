@@ -125,7 +125,9 @@ pub fn run(eff: &Effectiveness, settings: &PlannerSettings, write: bool, skip: &
             continue; // week is voorbij
         }
         let name = week_name(addr).unwrap_or_default();
-        let rest = name.contains("Rest");
+        let custom = settings.custom.for_week(*start);
+        // een rustweek blijft van FM, behalve als de gebruiker er zelf een schema aan gaf
+        let rest = name.contains("Rest") && !custom.is_some_and(|(_, explicit)| explicit);
         if rest {
             out.weeks.push(WeekPreview {
                 start: *start,
@@ -148,18 +150,6 @@ pub fn run(eff: &Effectiveness, settings: &PlannerSettings, write: bool, skip: &
         let next_mon = weeks.get(i + 1).is_some_and(|w| w.1[0].contains(&500));
         let cw = CalendarWeek { start: *start, kind: kind_for(*start), matches, note: String::new() };
         let plan = planner::plan_week(&cw, prev_sun, next_mon, &proj, settings, i as u32 + 1);
-        // geschatte vooruitgang: de volgende week mikt op wat dan het zwakst is
-        for f in crate::model::Factor::TACTICAL_AREAS {
-            let n = plan.targets.iter().find(|(x, _)| *x == f).map(|(_, n)| *n).unwrap_or(0);
-            let mut v = proj.get(f);
-            for _ in 0..n {
-                v += settings.gain_per_session * (1.0 - v / 105.0).max(0.0);
-            }
-            if n == 0 {
-                v -= settings.decay_per_week;
-            }
-            proj.set(f, v);
-        }
 
         let mut planned = cur.clone();
         let mut editable = [false; 7];
@@ -177,6 +167,25 @@ pub fn run(eff: &Effectiveness, settings: &PlannerSettings, write: bool, skip: &
                     }
                 }
             }
+        }
+        // eigen schema: in plaats van het automatische plan (de dagen rond wedstrijden naar keuze
+        // nog van de planner)
+        let roles: Vec<planner::DayRole> = plan.days.iter().map(|d| d.role).collect();
+        if let Some((sched, _)) = custom {
+            planned = crate::custom::apply(sched, cur, &planned, &roles, &editable);
+        }
+        // geschatte vooruitgang: de volgende week mikt op wat dan het zwakst is (geteld op wat er
+        // echt komt te staan, ook met een eigen schema)
+        for f in crate::model::Factor::TACTICAL_AREAS {
+            let n = planned.iter().flatten().filter(|c| model::session_by_code(**c) == Some(f.label())).count();
+            let mut v = proj.get(f);
+            for _ in 0..n {
+                v += settings.gain_per_session * (1.0 - v / 105.0).max(0.0);
+            }
+            if n == 0 {
+                v -= settings.decay_per_week;
+            }
+            proj.set(f, v);
         }
         let mut written = 0;
         if write && !skip.contains(start) && planned != *cur {
@@ -197,7 +206,10 @@ pub fn run(eff: &Effectiveness, settings: &PlannerSettings, write: bool, skip: &
             name,
             rest: false,
             matches: matches.iter().filter(|m| **m).count(),
-            focus: plan.focus.to_string(),
+            focus: match custom {
+                Some((sched, _)) => sched.name.clone(),
+                None => plan.focus.to_string(),
+            },
             current: cur.clone(),
             planned,
             editable,
