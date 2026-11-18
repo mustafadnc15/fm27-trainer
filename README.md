@@ -54,7 +54,8 @@ back. The activity log shows exactly what FM wanted and what was restored.
 **Custom schedules, including shared `.fmf` files.** Training schedules people share online (the `.fmf` FM27
 exports from its training screen) can be imported on the Training page, or dropped on the app window. You can
 also build a schedule yourself, or save any coming week as FM has it. Give a schedule to the next few weeks, to a
-single week, or make it the default for every week; the app then writes it into FM's calendar instead of its own
+single week, make it the default for every week, or set up a *repeating pattern* (for example C1, C2, C3, C4,
+then C1 again) that runs week after week; the app then writes it into FM's calendar instead of its own
 plan and keeps it there like any other plan. Match and travel days stay with FM, and a slot set to *FM's choice*
 is left alone. Optionally the days around a match follow the automatic rhythm (recovery after, match
 preparation before), so a schedule built for a Saturday match still works in a midweek-fixture week.

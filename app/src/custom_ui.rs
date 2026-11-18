@@ -5,7 +5,7 @@ use chrono::NaiveDate;
 use eframe::egui::{self, RichText, Ui};
 use std::path::PathBuf;
 
-use crate::custom::{CustomSchedule, CustomTraining};
+use crate::custom::{CustomSchedule, CustomTraining, Source};
 use crate::model::{self, Category};
 use crate::t;
 use crate::theme::{self, icon};
@@ -146,6 +146,8 @@ pub fn card(ui: &mut Ui, c: &mut CustomTraining, st: &mut UiState, today: Option
                 ui.label(theme::faint(t!("(eerst met FM verbinden)", "(connect to FM first)")));
             }
         });
+        ui.add_space(6.0);
+        out.changed |= pattern(ui, c, today);
         ui.add_space(6.0);
 
         let mut remove = None;
@@ -302,9 +304,16 @@ pub fn week_choice(ui: &mut Ui, c: &mut CustomTraining, monday: NaiveDate) -> bo
         return false;
     }
     let mut changed = false;
-    let auto = t!("Automatisch", "Automatic").to_string();
-    let default = c.default.clone().map(|d| t!(format!("Standaard ({d})"), format!("Default ({d})"))).unwrap_or_else(|| auto.clone());
     let own = c.assigned.get(&monday).cloned();
+    // wat de week krijgt zonder eigen keuze: patroon, standaard of de automatische planner
+    let mut without = c.clone();
+    without.assigned.remove(&monday);
+    let default = match without.source(monday) {
+        Some((s, Source::Pattern(i))) => t!(format!("Patroon {}/{}: {}", i + 1, c.pattern.len(), s.name), format!("Pattern {}/{}: {}", i + 1, c.pattern.len(), s.name)),
+        Some((s, _)) => t!(format!("Standaard ({})", s.name), format!("Default ({})", s.name)),
+        None => t!("Automatisch", "Automatic").to_string(),
+    };
+    let follows_something = without.source(monday).is_some();
     let only_auto = t!("Automatische planner (alleen deze week)", "Automatic planner (this week only)");
     let text = match own.as_deref() {
         Some("") => only_auto.to_string(),
@@ -316,7 +325,7 @@ pub fn week_choice(ui: &mut Ui, c: &mut CustomTraining, monday: NaiveDate) -> bo
             c.assign(monday, 1, None);
             changed = true;
         }
-        if c.default.is_some() && ui.selectable_label(own.as_deref() == Some(""), only_auto).clicked() {
+        if follows_something && ui.selectable_label(own.as_deref() == Some(""), only_auto).clicked() {
             // een eigen toewijzing die naar geen schema wijst = automatisch
             c.assigned.insert(monday, String::new());
             changed = true;
@@ -336,4 +345,94 @@ pub fn save_week(c: &mut CustomTraining, start: NaiveDate, codes: &[[u16; 3]]) -
     let name = c.free_name(&t!(format!("Week {}", crate::i18n::date_short(start)), format!("Week {}", crate::i18n::date_short(start))));
     c.schedules.push(CustomSchedule::from_codes(&name, codes));
     name
+}
+
+/// Repeating pattern: schedules week after week in a fixed order (C1, C2, C3, C4, C1, …).
+fn pattern(ui: &mut Ui, c: &mut CustomTraining, today: Option<NaiveDate>) -> bool {
+    let mut changed = false;
+    let this_week = today.map(crate::planner::monday_of);
+    ui.horizontal(|ui| {
+        if theme::toggle(ui, &mut c.pattern_on).changed() {
+            changed = true;
+        }
+        ui.label(theme::label_strong(t!("Herhalend patroon", "Repeating pattern")));
+        ui.label(theme::faint(t!("schema's week na week in deze volgorde, daarna weer vooraan", "schedules week after week in this order, then from the start again")));
+    });
+    // het patroon begint deze week als er nog geen begin is
+    if c.pattern_on && c.pattern_start.is_none() {
+        if let Some(w) = this_week {
+            c.pattern_start = Some(w);
+            changed = true;
+        }
+    }
+    if !c.pattern_on {
+        return changed;
+    }
+    ui.horizontal_wrapped(|ui| {
+        let mut remove = None;
+        let mut swap = None;
+        for (i, n) in c.pattern.iter().enumerate() {
+            theme::pill(ui, &format!("{}. {n}", i + 1), theme::ACCENT);
+            if i > 0 && theme::small_button(ui, "←", true).on_hover_text(t!("Eerder", "Earlier")).clicked() {
+                swap = Some(i);
+            }
+            if theme::small_button(ui, &icon::X.to_string(), true).on_hover_text(t!("Uit het patroon", "Remove from the pattern")).clicked() {
+                remove = Some(i);
+            }
+            ui.add_space(6.0);
+        }
+        if let Some(i) = swap {
+            c.pattern.swap(i - 1, i);
+            changed = true;
+        }
+        if let Some(i) = remove {
+            c.pattern.remove(i);
+            changed = true;
+        }
+        egui::ComboBox::from_id_salt("pattern_add").selected_text(format!("{} {}", icon::PLUS, t!("Voeg toe", "Add"))).show_ui(ui, |ui| {
+            for n in c.schedules.iter().map(|s| s.name.clone()).collect::<Vec<_>>() {
+                if ui.selectable_label(false, &n).clicked() {
+                    c.pattern.push(n);
+                    changed = true;
+                }
+            }
+        });
+    });
+    ui.horizontal(|ui| {
+        match c.pattern_start {
+            Some(st) => {
+                ui.label(theme::dim(t!(format!("Begint in de week van {}", crate::i18n::date_short(st)), format!("Starts in the week of {}", crate::i18n::date_short(st)))));
+            }
+            None => {
+                ui.label(theme::faint(t!("Begint deze week zodra FM verbonden is.", "Starts this week once FM is connected.")));
+            }
+        }
+        if let Some(w) = this_week {
+            if c.pattern_start != Some(w) && theme::small_button(ui, t!("Begin deze week opnieuw", "Restart this week"), true).clicked() {
+                c.pattern_start = Some(w);
+                changed = true;
+            }
+        }
+    });
+    // de komende weken volgens het patroon
+    if let (Some(w), false) = (this_week, c.pattern.is_empty()) {
+        let next: Vec<String> = (0..c.pattern.len().clamp(4, 8))
+            .map(|k| w + chrono::Duration::weeks(k as i64))
+            .map(|m| {
+                let name = c.source(m).map(|(s, _)| s.name.clone()).unwrap_or_else(|| t!("automatisch", "automatic").to_string());
+                format!("{} {name}", crate::i18n::date_short(m))
+            })
+            .collect();
+        ui.add(egui::Label::new(theme::faint(t!(format!("Komende weken: {}", next.join(" · ")), format!("Coming weeks: {}", next.join(" · "))))).wrap());
+    }
+    if !c.assigned.is_empty() {
+        ui.add(
+            egui::Label::new(theme::faint(t!(
+                "Een week met een eigen keuze (op de weekkaart of via Gebruik N weken) gaat voor het patroon.",
+                "A week with its own choice (on the week card or via Use for N weeks) goes before the pattern."
+            )))
+            .wrap(),
+        );
+    }
+    changed
 }

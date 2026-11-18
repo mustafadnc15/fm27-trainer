@@ -63,6 +63,25 @@ pub struct CustomTraining {
     /// Schedule for every week without its own assignment (None = automatic planner).
     #[serde(default)]
     pub default: Option<String>,
+    /// Repeating pattern: schedules used week after week in this order, then from the start again
+    /// (C1, C2, C3, C4, C1, …). Overrides `default`; a week's own assignment overrides the pattern.
+    #[serde(default)]
+    pub pattern: Vec<String>,
+    /// Monday of the week that gets the first entry of the pattern.
+    #[serde(default)]
+    pub pattern_start: Option<NaiveDate>,
+    /// The pattern can be switched off without losing it.
+    #[serde(default)]
+    pub pattern_on: bool,
+}
+
+/// Where a week's schedule comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    Assigned,
+    /// Entry `n` (0-based) of the pattern.
+    Pattern(usize),
+    Default,
 }
 
 impl CustomTraining {
@@ -72,10 +91,32 @@ impl CustomTraining {
 
     /// The schedule for a week and whether it was assigned to that week explicitly.
     pub fn for_week(&self, monday: NaiveDate) -> Option<(&CustomSchedule, bool)> {
+        self.source(monday).map(|(s, src)| (s, src == Source::Assigned))
+    }
+
+    /// The schedule for a week and where it comes from: the week's own choice, then the pattern,
+    /// then the default. None = automatic planner.
+    pub fn source(&self, monday: NaiveDate) -> Option<(&CustomSchedule, Source)> {
         if let Some(n) = self.assigned.get(&monday) {
-            return self.get(n).map(|s| (s, true));
+            // an own choice that names no schedule = automatic planner for this week
+            return self.get(n).map(|s| (s, Source::Assigned));
         }
-        self.default.as_deref().and_then(|n| self.get(n)).map(|s| (s, false))
+        if let Some(i) = self.pattern_index(monday) {
+            if let Some(s) = self.get(&self.pattern[i]) {
+                return Some((s, Source::Pattern(i)));
+            }
+        }
+        self.default.as_deref().and_then(|n| self.get(n)).map(|s| (s, Source::Default))
+    }
+
+    /// Which entry of the pattern a week gets (None: no pattern, or the week is before its start).
+    pub fn pattern_index(&self, monday: NaiveDate) -> Option<usize> {
+        let start = self.pattern_start?;
+        if !self.pattern_on || self.pattern.is_empty() || monday < start {
+            return None;
+        }
+        let weeks = (monday - start).num_days().div_euclid(7) as usize;
+        Some(weeks % self.pattern.len())
     }
 
     /// Assign a schedule (None = automatic planner) to `count` weeks from `first` on.
@@ -108,6 +149,9 @@ impl CustomTraining {
         if self.default.as_deref() == Some(old) {
             self.default = Some(new.to_string());
         }
+        for v in self.pattern.iter_mut().filter(|v| *v == old) {
+            *v = new.to_string();
+        }
     }
 
     pub fn remove(&mut self, name: &str) {
@@ -116,6 +160,7 @@ impl CustomTraining {
         if self.default.as_deref() == Some(name) {
             self.default = None;
         }
+        self.pattern.retain(|v| v != name);
     }
 
     /// A name that is not in use yet ("Custom 1", "Custom 2", …).
@@ -180,6 +225,32 @@ mod tests {
         assert_eq!(c.assigned.keys().copied().collect::<Vec<_>>(), vec![day(7), day(14)]);
         c.assign(day(7), 1, None);
         assert_eq!(c.assigned.len(), 1);
+    }
+
+    #[test]
+    fn repeating_pattern() {
+        let mut c = CustomTraining::default();
+        for n in ["C1", "C2", "C3", "C4", "D"] {
+            c.schedules.push(CustomSchedule::new(n));
+        }
+        c.default = Some("D".into());
+        c.pattern = ["C1", "C2", "C3", "C4"].map(String::from).to_vec();
+        c.pattern_start = Some(day(7));
+        let name = |c: &CustomTraining, w: u32| c.source(day(7 * w)).map(|(s, src)| (s.name.clone(), src));
+        assert_eq!(name(&c, 1).unwrap().0, "D", "pattern off");
+        c.pattern_on = true;
+        assert_eq!(name(&c, 0).unwrap().0, "D", "before the start");
+        let got: Vec<String> = (1..=9).map(|w| name(&c, w).unwrap().0).collect();
+        assert_eq!(got, ["C1", "C2", "C3", "C4", "C1", "C2", "C3", "C4", "C1"]);
+        assert_eq!(name(&c, 3).unwrap().1, Source::Pattern(2));
+        c.assign(day(14), 1, Some("D"));
+        assert_eq!(name(&c, 2), Some(("D".into(), Source::Assigned)), "a week's own choice wins");
+        c.assigned.insert(day(21), String::new());
+        assert_eq!(name(&c, 3), None, "automatic for this week only");
+        c.rename("C2", "Two");
+        assert_eq!(c.pattern[1], "Two");
+        c.remove("C3");
+        assert_eq!(c.pattern, ["C1", "Two", "C4"]);
     }
 
     #[test]
