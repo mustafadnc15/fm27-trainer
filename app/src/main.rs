@@ -1,7 +1,10 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod agent;
+mod custom;
+mod custom_ui;
 mod export;
+mod fmf;
 mod gui;
 mod i18n;
 mod labels;

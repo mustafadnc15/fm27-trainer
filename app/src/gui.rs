@@ -158,6 +158,8 @@ struct App {
     tactic_pick: Option<usize>,
     tactics_asked: bool,
     frames: u32,
+    /// Eigen schema's op de Training-pagina (bewerken, importeren).
+    custom_ui: crate::custom_ui::UiState,
 }
 
 impl App {
@@ -221,6 +223,7 @@ impl App {
                 l
             },
             frames: 0,
+            custom_ui: Default::default(),
         }
     }
 
@@ -794,6 +797,24 @@ impl App {
         }
         ui.add_space(14.0);
 
+        // ---- eigen schema's (ook zonder verbinding: importeren en bewerken)
+        let today = self.live.training.as_ref().and_then(|o| o.today);
+        if let Some(t0) = today {
+            let before = self.settings.planner.custom.assigned.len();
+            self.settings.planner.custom.prune(t0);
+            if before != self.settings.planner.custom.assigned.len() {
+                self.save_settings();
+            }
+        }
+        let r = crate::custom_ui::card(ui, &mut self.settings.planner.custom, &mut self.custom_ui, today);
+        if r.changed {
+            self.save_settings();
+            if connected && !self.live.busy() {
+                self.live.training(ctx, &self.eff, &self.settings.planner, false, false);
+            }
+        }
+        ui.add_space(14.0);
+
         if !connected {
             self.connect_card(ui, ctx);
             return;
@@ -834,9 +855,16 @@ impl App {
             legend(ui);
         });
         ui.add_space(6.0);
+        let mut changed = false;
         for w in &o.weeks {
-            week_card(ui, w, o.today, &self.live.fm_had);
+            changed |= week_card(ui, w, o.today, &self.live.fm_had, &mut self.settings.planner.custom, &mut self.custom_ui);
             ui.add_space(10.0);
+        }
+        if changed {
+            self.save_settings();
+            if !self.live.busy() {
+                self.live.training(ctx, &self.eff, &self.settings.planner, false, false);
+            }
         }
     }
 
@@ -2356,6 +2384,14 @@ impl eframe::App for App {
             self.auto_pending = true;
             self.start_analysis(ctx, None);
         }
+        // .fmf-bestanden (gedeelde trainingsschema's) op het venster gesleept
+        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        let fmf: Vec<PathBuf> = dropped.into_iter().filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("fmf"))).collect();
+        if !fmf.is_empty() {
+            (self.custom_ui.message, self.custom_ui.error) = crate::custom_ui::import(&mut self.settings.planner.custom, &fmf);
+            self.save_settings();
+            self.page = Page::Training;
+        }
         self.live.allow_untested = self.settings.allow_untested;
         self.live.choice = (self.settings.manager_club, self.settings.training_team);
         self.live.keep_understanding = self.settings.keep_understanding;
@@ -2467,10 +2503,29 @@ fn codes_text(c: &[u16; 3]) -> String {
     c.iter().map(|x| chip_name(session_by_code(*x).unwrap_or("?"))).collect::<Vec<_>>().join(" · ")
 }
 
-fn week_card(ui: &mut Ui, w: &live_training::WeekPreview, today: Option<NaiveDate>, fm_had: &std::collections::HashMap<NaiveDate, [u16; 3]>) {
+/// Eén komende week. Geeft true als de gebruiker het schema van de week veranderde.
+fn week_card(
+    ui: &mut Ui,
+    w: &live_training::WeekPreview,
+    today: Option<NaiveDate>,
+    fm_had: &std::collections::HashMap<NaiveDate, [u16; 3]>,
+    custom: &mut crate::custom::CustomTraining,
+    custom_ui: &mut crate::custom_ui::UiState,
+) -> bool {
+    let mut changed = false;
     theme::card(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label(theme::h2(t!(format!("Week van {}", i18n::date_short(w.start)), format!("Week of {}", i18n::date_short(w.start)))));
+            changed |= crate::custom_ui::week_choice(ui, custom, w.start);
+            if theme::small_button(ui, &format!("{} {}", icon::FLOPPY_DISK, t!("Bewaar als schema", "Save as schedule")), true)
+                .on_hover_text(t!("De week zoals FM hem nu heeft, als eigen schema", "This week as FM has it now, as a custom schedule"))
+                .clicked()
+            {
+                let name = crate::custom_ui::save_week(custom, w.start, &w.current);
+                custom_ui.message = t!(format!("Bewaard als {name} (bij Eigen schema's)."), format!("Saved as {name} (under Custom schedules)."));
+                custom_ui.error = false;
+                changed = true;
+            }
             if w.rest {
                 theme::pill(ui, t!("Rustweek: blijft van FM", "Rest week: kept from FM"), theme::WARNING);
                 return;
@@ -2514,6 +2569,7 @@ fn week_card(ui: &mut Ui, w: &live_training::WeekPreview, today: Option<NaiveDat
             }
         });
     });
+    changed
 }
 
 fn plan_grid(ui: &mut Ui, p: &WeekPlan) {
