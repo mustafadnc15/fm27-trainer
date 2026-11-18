@@ -244,6 +244,20 @@ met `expect`), `discover`. Zie `agent/src/lib.rs`.
   undo) en een plannertest. **Niet live getest**: of FM voor een jeugd- of B-team een eigen weeklijst bijhoudt,
   is niet gemeten. Er is één set uitgelezen waarden; die wordt niet per team bewaard.
 
+## Twee trainers: eerste elftal en jeugdteam (19 nov 2026, fork, nog niet gebouwd)
+
+- Overzicht, Training, Planning en Instellingen → Planner hebben een schakelaar Eerste elftal / Jeugdteam
+  (`TeamSlot` in `app/src/live.rs`, `App.slot`). Per trainer: eigen meting (`effectiveness.json` /
+  `effectiveness-youth.json`), eigen planner-instellingen (`planner` / `planner_youth`), eigen schakelaar
+  automatisch bijhouden (`auto_training` / `auto_training_youth`, jeugd standaard uit), eigen plan, status en
+  "FM had" (`LiveState.train[slot]`). Het logboek is gedeeld, regels hebben een `slot`.
+- Jeugdteam = `Settings.youth_team`, anders het eerste team van de club dat niet het eigen team is en `kind != 0`.
+- Automatisch: elke 8 s één ronde met beide trainers na elkaar (jeugd alleen met jeugdteam en eigen meting).
+- Module: `training_weeks`/`set_week` nemen optioneel `"team"` (plek in de teamlijst of `"own"`), dat gaat vóór
+  de keuze van `select` (`TeamPick` in `game.rs`, test in `run_market`). De app stuurt het altijd mee en zet voor
+  de jeugdronde ook `select` om en terug (voor een oudere Mac-module zonder `"team"`).
+- Geschreven zonder compiler (geen Rust op deze pc): eerst `cargo test` en `cargo build`. Niet live getest.
+
 ## Intel-Mac start niet (GitHub #5, 16 nov 2026, uitgebracht in 0.2.7)
 
 - 0.2.6 crashte bij het starten op een Intel-Mac (macOS 15): `Library not loaded: @rpath/libswiftCoreMedia.dylib`,

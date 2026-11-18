@@ -952,6 +952,19 @@ fn run_market(l: &'static Layout, m: &Market) {
     assert_eq!(mem::u16_at(m.u21_week + 0x10 + 2), Some(4));
     call(json!({"cmd": "undo"})).unwrap();
     assert_eq!(mem::u16_at(m.u21_week + 0x10 + 2), Some(301));
+    // een team per opdracht ("team") gaat voor de gedeelde keuze, zonder die te veranderen
+    let tw = |team: Value| call(json!({"cmd": "training_weeks", "team": team})).unwrap()["weeks"][0]["days"][0][0].clone();
+    assert_eq!(tw(json!("own")), 300, "eigen team ondanks select team 1");
+    assert_eq!(tw(json!(1)), 301);
+    assert_eq!(first_code(), 301, "de keuze van select blijft staan");
+    call(json!({"cmd": "select", "team": null})).unwrap();
+    assert_eq!(tw(json!(1)), 301, "jeugdteam ondanks select eigen team");
+    let mut w = week2.clone();
+    w["team"] = json!(1);
+    assert_eq!(call(w).unwrap()["days"], 7);
+    assert_eq!(mem::u16_at(m.u21_week + 0x10 + 2), Some(4), "geschreven in het jeugdteam");
+    call(json!({"cmd": "undo"})).unwrap();
+    assert_eq!(mem::u16_at(m.u21_week + 0x10 + 2), Some(301));
     // de andere manager: club, selectie en kalender van Milan
     let t = call(json!({"cmd": "select", "club": 45})).unwrap();
     assert_eq!(t["managers"][1]["selected"], true);

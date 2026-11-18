@@ -67,28 +67,71 @@ pub struct LogEntry {
     pub at: chrono::DateTime<chrono::Local>,
     pub text: String,
     pub auto: bool,
+    /// bij welke trainer de regel hoort (None: niet de training, bv. tactisch begrip)
+    pub slot: Option<TeamSlot>,
 }
+
+/// De twee trainers: het eerste elftal en het jeugdteam, elk met een eigen meting, eigen
+/// planner-instellingen en een eigen kalender in FM.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub enum TeamSlot {
+    #[default]
+    First,
+    Youth,
+}
+
+impl TeamSlot {
+    pub const ALL: [TeamSlot; 2] = [TeamSlot::First, TeamSlot::Youth];
+
+    pub fn i(self) -> usize {
+        self as usize
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TeamSlot::First => t!("Eerste elftal", "First team"),
+            TeamSlot::Youth => t!("Jeugdteam", "Youth team"),
+        }
+    }
+}
+
+/// Wat de app per trainer bijhoudt.
+#[derive(Default)]
+pub struct TeamTraining {
+    pub training: Option<Outcome>,
+    /// Per dag: wat FM had ingepland voordat de app het terugzette.
+    pub fm_had: HashMap<NaiveDate, [u16; 3]>,
+    pub status: String,
+    pub error: bool,
+    /// Dagen die deze sessie zijn (terug)gezet.
+    pub fixed_total: usize,
+    pub last_check: Option<chrono::DateTime<chrono::Local>>,
+}
+
+/// Een trainer zoals de app hem elke frame doorgeeft: zijn meting, zijn instellingen en of
+/// automatisch bijhouden voor hem aan staat.
+pub struct TrainInput<'a> {
+    pub eff: &'a Effectiveness,
+    pub settings: &'a PlannerSettings,
+    pub auto: bool,
+}
+
+type TrainResult = (bool, bool, Vec<(TeamSlot, Result<Outcome, String>)>);
 
 pub struct LiveState {
     pub connected: bool,
     /// Wat er de laatste keer gebeurde met de training (nieuwste eerst).
     pub log: Vec<LogEntry>,
-    pub last_check: Option<chrono::DateTime<chrono::Local>>,
-    /// Dagen die deze sessie zijn (terug)gezet.
-    pub fixed_total: usize,
-    /// Per dag: wat FM had ingepland voordat de app het terugzette.
-    pub fm_had: HashMap<NaiveDate, [u16; 3]>,
+    /// per trainer (`TeamSlot::i`): plan, status en wat er is teruggezet
+    pub train: [TeamTraining; 2],
     pub club: Option<Value>,
     pub squad: Vec<Value>,
     /// tactisch begrip van de selectie (opdracht `understanding`)
     pub understanding: Option<Value>,
     /// editorvlaggen van de manager (opdracht `human_flags`)
     pub human_flags: Option<Value>,
-    pub training: Option<Outcome>,
     pub status: String,
     pub status_error: bool,
-    pub train_status: String,
-    pub train_error: bool,
     pub transfer_input: String,
     pub wage_input: String,
     /// Aanpassen op een FM-build die nog niet live getest is (instelling van de gebruiker).
@@ -105,10 +148,12 @@ pub struct LiveState {
     pub teams: Option<Value>,
     /// keuze van de gebruiker: (UID van de club van de manager, plek van het team voor de training)
     pub choice: (Option<u32>, Option<usize>),
+    /// plek van het jeugdteam in de teamlijst van de club (None: geen jeugdteam gekozen of gevonden)
+    pub youth_team: Option<usize>,
     tactics_rx: Option<mpsc::Receiver<Result<Value, String>>>,
     aux_rx: Option<mpsc::Receiver<(Aux, Result<Value, String>)>>,
     rx: Option<mpsc::Receiver<Snapshot>>,
-    train_rx: Option<mpsc::Receiver<(bool, bool, Result<Outcome, String>)>>,
+    train_rx: Option<mpsc::Receiver<TrainResult>>,
     last_auto: Option<Instant>,
     last_poll: Option<Instant>,
 }
@@ -118,18 +163,13 @@ impl Default for LiveState {
         LiveState {
             connected: false,
             log: Vec::new(),
-            last_check: None,
-            fixed_total: 0,
-            fm_had: HashMap::new(),
+            train: Default::default(),
             club: None,
             squad: Vec::new(),
             understanding: None,
             human_flags: None,
-            training: None,
             status: String::new(),
             status_error: false,
-            train_status: String::new(),
-            train_error: false,
             transfer_input: String::new(),
             wage_input: String::new(),
             allow_untested: false,
@@ -140,6 +180,7 @@ impl Default for LiveState {
             tactics_error: String::new(),
             teams: None,
             choice: (None, None),
+            youth_team: None,
             tactics_rx: None,
             aux_rx: None,
             rx: None,
@@ -264,8 +305,10 @@ impl LiveState {
     /// Een andere manager of een ander team: wat van het vorige team was, vervalt.
     pub fn choose(&mut self, ctx: &egui::Context, choice: (Option<u32>, Option<usize>)) {
         self.choice = choice;
-        self.training = None;
-        self.fm_had.clear();
+        for t in &mut self.train {
+            t.training = None;
+            t.fm_had.clear();
+        }
         self.tactics = None;
         self.last_auto = Some(Instant::now());
         self.last_poll = None;
@@ -373,36 +416,75 @@ impl LiveState {
         self.rx = Some(rx);
     }
 
-    pub fn training(&mut self, ctx: &egui::Context, eff: &Effectiveness, settings: &PlannerSettings, write: bool, only_new: bool) {
-        self.training_job(ctx, eff, settings, write, only_new, false);
+    pub fn team(&self, slot: TeamSlot) -> &TeamTraining {
+        &self.train[slot.i()]
     }
 
-    fn training_job(&mut self, ctx: &egui::Context, eff: &Effectiveness, settings: &PlannerSettings, write: bool, only_new: bool, auto: bool) {
-        if self.busy() {
+    /// Het team dat een trainer bedient, zoals de module het per opdracht krijgt (`"team"`):
+    /// eerste elftal = het gekozen team of het eigen team, jeugdteam = de gekozen plek. None als er
+    /// (nog) geen jeugdteam is.
+    fn team_value(&self, slot: TeamSlot) -> Option<Value> {
+        match slot {
+            TeamSlot::First => Some(self.choice.1.map(|i| json!(i)).unwrap_or_else(|| json!("own"))),
+            TeamSlot::Youth => self.youth_team.map(|i| json!(i)),
+        }
+    }
+
+    /// Eén trainer met de hand: plan bekijken (`write` false) of in FM zetten.
+    pub fn training(&mut self, ctx: &egui::Context, slot: TeamSlot, eff: &Effectiveness, settings: &PlannerSettings, write: bool) {
+        self.training_job(ctx, vec![(slot, eff.clone(), settings.clone())], write, false);
+    }
+
+    fn training_job(&mut self, ctx: &egui::Context, jobs: Vec<(TeamSlot, Effectiveness, PlannerSettings)>, write: bool, auto: bool) {
+        if self.busy() || jobs.is_empty() {
             return;
         }
+        let jobs: Vec<_> = jobs.into_iter().map(|(slot, e, s)| (slot, self.team_value(slot), e, s)).collect();
+        if !auto {
+            for (slot, ..) in &jobs {
+                let t = &mut self.train[slot.i()];
+                t.status = if write { t!("Training wordt in FM gezet…", "Writing training into FM…").into() } else { t!("Plan wordt gemaakt…", "Building plan…").into() };
+                t.error = false;
+            }
+        }
         let (tx, rx) = mpsc::channel();
-        let (eff, settings) = (eff.clone(), settings.clone());
-        let _ = only_new;
         let skip: HashSet<NaiveDate> = HashSet::new();
         let ctx2 = ctx.clone();
         let choice = self.choice;
         std::thread::spawn(move || {
-            // de keuze kan net veranderd zijn: nooit in de kalender van het vorige team schrijven
+            // de keuze van de manager doorgeven; het team gaat met elke trainingsopdracht zelf mee,
+            // zodat een week nooit in de kalender van de andere trainer belandt
             let _ = select(choice);
-            let r = live_training::run(&eff, &settings, write, &skip).map_err(|e| format!("{e:#}"));
-            let _ = tx.send((write, auto, r));
+            let mut out = Vec::new();
+            for (slot, team, eff, settings) in jobs {
+                // ook de gedeelde keuze op dit team zetten: een oudere module (Mac) kent "team" per
+                // opdracht niet en zou anders in de kalender van het eerste elftal schrijven
+                let own_choice = (choice.0, team.as_ref().and_then(|t| t.as_u64()).map(|n| n as usize));
+                if own_choice != choice {
+                    let _ = select(own_choice);
+                }
+                let r = match team {
+                    Some(team) => live_training::run(&eff, &settings, write, &skip, &team).map_err(|e| format!("{e:#}")),
+                    None => Err(t!(
+                        "Geen jeugdteam gekozen: kies hierboven het team van deze trainer.",
+                        "No youth team chosen: pick this trainer's team above."
+                    )
+                    .to_string()),
+                };
+                if own_choice != choice {
+                    let _ = select(choice);
+                }
+                out.push((slot, r));
+            }
+            let _ = tx.send((write, auto, out));
             ctx2.request_repaint();
         });
         self.train_rx = Some(rx);
-        if !auto {
-            self.train_status = if write { t!("Training wordt in FM gezet…", "Writing training into FM…").into() } else { t!("Plan wordt gemaakt…", "Building plan…").into() };
-            self.train_error = false;
-        }
     }
 
     /// Elke frame: resultaten ophalen, automatisch verbinden en (optioneel) automatisch plannen.
-    pub fn tick(&mut self, ctx: &egui::Context, eff: &Effectiveness, settings: &PlannerSettings, auto: bool) {
+    /// `inputs`: de trainers van het eerste elftal en het jeugdteam (in de volgorde van `TeamSlot`).
+    pub fn tick(&mut self, ctx: &egui::Context, inputs: [TrainInput; 2]) {
         if let Some(rx) = &self.rx {
             if let Ok(s) = rx.try_recv() {
                 self.rx = None;
@@ -429,7 +511,7 @@ impl LiveState {
                         format!("Tactisch begrip teruggezet naar 100 % voor {n} spelers (FM had het laten zakken)."),
                         format!("Tactical understanding put back to 100% for {n} players (FM had let it drop).")
                     );
-                    self.log.insert(0, LogEntry { at: chrono::Local::now(), text: text.clone(), auto: true });
+                    self.log.insert(0, LogEntry { at: chrono::Local::now(), text: text.clone(), auto: true, slot: None });
                     self.log.truncate(40);
                     if s.message.is_empty() {
                         self.status = text;
@@ -502,49 +584,10 @@ impl LiveState {
             }
         }
         if let Some(rx) = &self.train_rx {
-            if let Ok((wrote, auto, r)) = rx.try_recv() {
+            if let Ok((wrote, auto, results)) = rx.try_recv() {
                 self.train_rx = None;
-                self.last_check = Some(chrono::Local::now());
-                match r {
-                    Ok(o) => {
-                        if wrote {
-                            // per week: wat FM had en wat er is teruggezet
-                            for w in o.weeks.iter().filter(|w| w.written > 0) {
-                                for d in 0..7 {
-                                    if w.editable[d] && w.current[d] != w.planned[d] {
-                                        self.fm_had.insert(w.start + Duration::days(d as i64), w.current[d]);
-                                    }
-                                }
-                                let date = crate::i18n::date_short(w.start);
-                                let text = if auto {
-                                    t!(
-                                        format!("Week van {date}: {} dagen teruggezet naar je plan (FM had de week opnieuw ingepland).", w.written),
-                                        format!("Week of {date}: {} days put back on plan (FM had re-planned the week).", w.written)
-                                    )
-                                } else {
-                                    t!(format!("Week van {date}: {} dagen in FM gezet.", w.written), format!("Week of {date}: {} days written into FM.", w.written))
-                                };
-                                self.log.insert(0, LogEntry { at: chrono::Local::now(), text, auto });
-                            }
-                            self.log.truncate(40);
-                            self.fixed_total += o.written_days;
-                        }
-                        if !auto {
-                            self.train_status = if !wrote {
-                                t!("Plan klaar. Groen = wordt aangepast.", "Plan ready. Green = will change.").into()
-                            } else if o.written_days == 0 {
-                                t!("Alles staat al volgens plan.", "Everything already follows the plan.").into()
-                            } else {
-                                t!(format!("{} dagen in FM gezet.", o.written_days), format!("{} days written into FM.", o.written_days))
-                            };
-                            self.train_error = false;
-                        }
-                        self.training = Some(o);
-                    }
-                    Err(e) => {
-                        self.train_status = e;
-                        self.train_error = true;
-                    }
+                for (slot, r) in results {
+                    self.train_result(slot, wrote, auto, r);
                 }
             }
         }
@@ -563,9 +606,74 @@ impl LiveState {
         let read_only = self.untested_build && !self.allow_untested;
         // een testopname (FM27_SNAPSHOT) mag nooit iets in FM veranderen
         let snapshot = std::env::var_os("FM27_SNAPSHOT").is_some();
-        if auto && !snapshot && self.connected && !read_only && !self.busy() && self.last_auto.is_none_or(|t| t.elapsed().as_secs() >= 8) {
-            self.last_auto = Some(Instant::now());
-            self.training_job(ctx, eff, settings, true, false, true);
+        if !snapshot && self.connected && !read_only && !self.busy() && self.last_auto.is_none_or(|t| t.elapsed().as_secs() >= 8) {
+            // beide trainers in één ronde, elk met zijn eigen meting, instellingen en kalender; het
+            // jeugdteam alleen als er een jeugdteam gekozen is en het een eigen meting heeft
+            let youth_ok = self.youth_team.is_some();
+            let jobs: Vec<_> = TeamSlot::ALL
+                .into_iter()
+                .zip(inputs)
+                .filter(|(slot, inp)| inp.auto && (*slot == TeamSlot::First || (youth_ok && !inp.eff.source.is_empty())))
+                .map(|(slot, inp)| (slot, inp.eff.clone(), inp.settings.clone()))
+                .collect();
+            if !jobs.is_empty() {
+                self.last_auto = Some(Instant::now());
+                self.training_job(ctx, jobs, true, true);
+            }
+        }
+    }
+
+    fn train_result(&mut self, slot: TeamSlot, wrote: bool, auto: bool, r: Result<Outcome, String>) {
+        let multi = self.youth_team.is_some();
+        let t = &mut self.train[slot.i()];
+        t.last_check = Some(chrono::Local::now());
+        match r {
+            Ok(o) => {
+                if wrote {
+                    // per week: wat FM had en wat er is teruggezet
+                    for w in o.weeks.iter().filter(|w| w.written > 0) {
+                        for d in 0..7 {
+                            if w.editable[d] && w.current[d] != w.planned[d] {
+                                t.fm_had.insert(w.start + Duration::days(d as i64), w.current[d]);
+                            }
+                        }
+                        let date = crate::i18n::date_short(w.start);
+                        let mut text = if auto {
+                            t!(
+                                format!("Week van {date}: {} dagen teruggezet naar je plan (FM had de week opnieuw ingepland).", w.written),
+                                format!("Week of {date}: {} days put back on plan (FM had re-planned the week).", w.written)
+                            )
+                        } else {
+                            t!(format!("Week van {date}: {} dagen in FM gezet.", w.written), format!("Week of {date}: {} days written into FM.", w.written))
+                        };
+                        if multi {
+                            text = format!("{}: {text}", slot.label());
+                        }
+                        self.log.insert(0, LogEntry { at: chrono::Local::now(), text, auto, slot: Some(slot) });
+                    }
+                    self.log.truncate(40);
+                    t.fixed_total += o.written_days;
+                }
+                if !auto {
+                    t.status = if !wrote {
+                        t!("Plan klaar. Groen = wordt aangepast.", "Plan ready. Green = will change.").into()
+                    } else if o.written_days == 0 {
+                        t!("Alles staat al volgens plan.", "Everything already follows the plan.").into()
+                    } else {
+                        t!(format!("{} dagen in FM gezet.", o.written_days), format!("{} days written into FM.", o.written_days))
+                    };
+                    t.error = false;
+                } else if t.error {
+                    // de vorige fout is voorbij
+                    t.status.clear();
+                    t.error = false;
+                }
+                t.training = Some(o);
+            }
+            Err(e) => {
+                t.status = e;
+                t.error = true;
+            }
         }
     }
 }

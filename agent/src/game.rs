@@ -687,7 +687,20 @@ fn club_teams(club: u64) -> Vec<u64> {
 /// Het team waarvan de app de training leest en schrijft: het gekozen team van de club, anders
 /// het team uit het contract van de manager.
 fn training_team(c: &Chain) -> u64 {
-    with_state(|s| s.chosen_team).and_then(|i| club_teams(c.club).get(i).copied()).filter(|t| mem::u64_at(t + TEAM_CLUB) == Some(c.club)).unwrap_or(c.team)
+    training_team_for(c, None)
+}
+
+/// Welk team een trainingsopdracht bedoelt: `None` = de keuze in de toestand (`select`),
+/// `Some(None)` = het eigen team van de manager, `Some(Some(i))` = plek i in de teamlijst.
+/// Zo kan de app eerste elftal en jeugdteam afwisselend bijhouden zonder de gedeelde keuze om te
+/// zetten (een gelijktijdige `select` kan dan nooit een week in de kalender van het andere team zetten).
+pub type TeamPick = Option<Option<usize>>;
+
+fn training_team_for(c: &Chain, pick: TeamPick) -> u64 {
+    pick.unwrap_or_else(|| with_state(|s| s.chosen_team))
+        .and_then(|i| club_teams(c.club).get(i).copied())
+        .filter(|t| mem::u64_at(t + TEAM_CLUB) == Some(c.club))
+        .unwrap_or(c.team)
 }
 
 #[derive(Serialize)]
@@ -1365,9 +1378,9 @@ fn read_week(rec: u64) -> Option<Week> {
     Some(Week { addr: format!("{rec:#x}"), start, days })
 }
 
-pub fn training_weeks() -> Result<(FmDate, Vec<Week>), String> {
+pub fn training_weeks(pick: TeamPick) -> Result<(FmDate, Vec<Week>), String> {
     let c = chain()?;
-    let hdr = training_weeks_header(training_team(&c))?;
+    let hdr = training_weeks_header(training_team_for(&c, pick))?;
     let list = weeks_header_ok(hdr).ok_or("weeklijst niet leesbaar")?;
     let today = game_date()?;
     Ok((today, list.into_iter().filter_map(read_week).collect()))
@@ -1375,12 +1388,12 @@ pub fn training_weeks() -> Result<(FmDate, Vec<Week>), String> {
 
 /// Schrijft de sessies van één week, alleen voor dagen ná de huidige spel-datum. Wedstrijd-
 /// en reisdagen (500/402) blijven altijd zoals FM ze heeft gezet.
-pub fn set_week(start: FmDate, days: &[[u16; 3]]) -> Result<usize, String> {
+pub fn set_week(start: FmDate, days: &[[u16; 3]], pick: TeamPick) -> Result<usize, String> {
     if days.len() != 7 {
         return Err("een week heeft 7 dagen".into());
     }
     let c = chain()?;
-    let hdr = training_weeks_header(training_team(&c))?;
+    let hdr = training_weeks_header(training_team_for(&c, pick))?;
     let list = weeks_header_ok(hdr).ok_or("weeklijst niet leesbaar")?;
     let today = game_date()?;
     let rec = list

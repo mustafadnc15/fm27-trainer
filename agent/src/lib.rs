@@ -130,6 +130,16 @@ fn uids(req: &Value) -> Option<Vec<u32>> {
     req.get("uids").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n as u32)).collect())
 }
 
+/// Optioneel `"team"` bij `training_weeks`/`set_week`: een plek in de teamlijst, of `"own"` voor
+/// het eigen team van de manager. Zonder: de keuze van `select`.
+fn team_pick(req: &Value) -> game::TeamPick {
+    match req.get("team")? {
+        Value::Number(n) => Some(n.as_u64().map(|n| n as usize)),
+        Value::String(s) if s == "own" => Some(None),
+        _ => None,
+    }
+}
+
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
@@ -193,11 +203,11 @@ pub fn dispatch(req: &Value) -> Result<Value, String> {
             game::inspire(&uids(req), morale, clear).map(|n| json!({"players": n}))
         }
         "game_date" => game::game_date().map(|d| json!(d)),
-        "training_weeks" => game::training_weeks().map(|(today, w)| json!({"today": today, "weeks": w})),
+        "training_weeks" => game::training_weeks(team_pick(req)).map(|(today, w)| json!({"today": today, "weeks": w})),
         "set_week" => {
             let start: game::FmDate = serde_json::from_value(req.get("start").cloned().ok_or("start ontbreekt")?).map_err(|e| e.to_string())?;
             let days: Vec<[u16; 3]> = serde_json::from_value(req.get("days").cloned().ok_or("days ontbreekt")?).map_err(|e| e.to_string())?;
-            game::set_week(start, &days).map(|n| json!({"days": n}))
+            game::set_week(start, &days, team_pick(req)).map(|n| json!({"days": n}))
         }
         "undo" => game::undo_last().map(|l| json!({"undone": l})),
         "human_flags" => game::human_flags().map(|f| json!(f)),

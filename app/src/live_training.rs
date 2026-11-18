@@ -173,11 +173,14 @@ pub fn run(eff: &Effectiveness, settings: &PlannerSettings, write: bool, skip: &
         }
         let mut written = 0;
         if write && !skip.contains(start) && planned != *cur {
-            let req = json!({
+            let mut req = json!({
                 "cmd": "set_week",
                 "start": {"year": start.year(), "doy": start.ordinal()},
                 "days": planned,
             });
+            if !team.is_null() {
+                req["team"] = team.clone();
+            }
             let r = agent::request(req).with_context(|| format!("week van {start} schrijven"))?;
             written = r.get("days").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             out.written_days += written;

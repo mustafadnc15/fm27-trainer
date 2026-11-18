@@ -11,7 +11,7 @@ use std::sync::mpsc;
 use crate::agent;
 use crate::export;
 use crate::i18n::{self, Lang};
-use crate::live::LiveState;
+use crate::live::{LiveState, TeamSlot, TrainInput};
 use crate::live_training;
 use crate::model::{Component, Effectiveness, Factor, category_of, level_color, level_name, session_by_code};
 use crate::planner::{self, CalendarOptions, CalendarWeek, PlannerSettings, WeekKind, WeekPlan, unique_schedules};
@@ -74,12 +74,52 @@ struct Settings {
     /// Het team waarvan de app de training plant (plek in de teamlijst van de club; None = eigen team).
     #[serde(default)]
     training_team: Option<usize>,
+    /// Het team van de jeugdtrainer (plek in de teamlijst van de club; None = het eerste jeugdteam
+    /// dat de app vindt).
+    #[serde(default)]
+    youth_team: Option<usize>,
+    /// Training van het jeugdteam automatisch bijhouden (staat uit tot de gebruiker het aanzet).
+    #[serde(default)]
+    auto_training_youth: bool,
     planner: PlannerSettings,
+    /// Planner-instellingen van de jeugdtrainer (los van die van het eerste elftal).
+    #[serde(default)]
+    planner_youth: PlannerSettings,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { lang: i18n::detect(), rate: 1.17, capture_delay: true, auto_training: true, allow_untested: false, keep_understanding: false, auto_read: false, auto_read_secs: 10, manager_club: None, training_team: None, planner: PlannerSettings::default() }
+        Settings { lang: i18n::detect(), rate: 1.17, capture_delay: true, auto_training: true, allow_untested: false, keep_understanding: false, auto_read: false, auto_read_secs: 10, manager_club: None, training_team: None, youth_team: None, auto_training_youth: false, planner: PlannerSettings::default(), planner_youth: PlannerSettings::default() }
+    }
+}
+
+impl Settings {
+    fn planner_for(&self, slot: TeamSlot) -> &PlannerSettings {
+        match slot {
+            TeamSlot::First => &self.planner,
+            TeamSlot::Youth => &self.planner_youth,
+        }
+    }
+
+    fn planner_mut(&mut self, slot: TeamSlot) -> &mut PlannerSettings {
+        match slot {
+            TeamSlot::First => &mut self.planner,
+            TeamSlot::Youth => &mut self.planner_youth,
+        }
+    }
+
+    fn auto_for(&self, slot: TeamSlot) -> bool {
+        match slot {
+            TeamSlot::First => self.auto_training,
+            TeamSlot::Youth => self.auto_training_youth,
+        }
+    }
+
+    fn auto_mut(&mut self, slot: TeamSlot) -> &mut bool {
+        match slot {
+            TeamSlot::First => &mut self.auto_training,
+            TeamSlot::Youth => &mut self.auto_training_youth,
+        }
     }
 }
 
@@ -131,7 +171,12 @@ struct App {
     /// de pagina die het vorige beeld toonde (voor de intrede-animatie)
     shown_page: Option<Page>,
     settings: Settings,
-    eff: Effectiveness,
+    /// uitgelezen waarden per trainer (`TeamSlot::i`): eerste elftal en jeugdteam
+    effs: [Effectiveness; 2],
+    /// de trainer die Overzicht, Training, Planning en de planner-instellingen nu tonen
+    slot: TeamSlot,
+    /// de trainer waarvoor de lopende uitlezing is (vastgelegd bij het starten)
+    analysis_slot: TeamSlot,
     status: String,
     status_error: bool,
     analysis_rx: Option<mpsc::Receiver<AnalysisResult>>,
@@ -191,7 +236,9 @@ impl App {
         App {
             page,
             shown_page: None,
-            eff: crate::load_effectiveness().unwrap_or_default(),
+            effs: [crate::load_effectiveness().unwrap_or_default(), crate::load_youth_effectiveness().unwrap_or_default()],
+            slot: if std::env::var("FM27_TEAM").as_deref() == Ok("youth") { TeamSlot::Youth } else { TeamSlot::First },
+            analysis_slot: TeamSlot::First,
             settings,
             status: String::new(),
             status_error: false,
@@ -267,14 +314,23 @@ impl App {
         self.status_error = error;
     }
 
+    fn save_eff(&self, slot: TeamSlot) {
+        let e = &self.effs[slot.i()];
+        let _ = match slot {
+            TeamSlot::First => crate::save_effectiveness(e),
+            TeamSlot::Youth => crate::save_youth_effectiveness(e),
+        };
+    }
+
     fn has_data(&self) -> bool {
-        !self.eff.source.is_empty()
+        !self.effs[self.slot.i()].source.is_empty()
     }
 
     // -------------------------------------------------------------------- analyse
 
     fn start_analysis(&mut self, ctx: &egui::Context, file: Option<PathBuf>) {
         let (tx, rx) = mpsc::channel();
+        self.analysis_slot = self.slot;
         let delay = self.settings.capture_delay && file.is_none() && !self.auto_pending;
         let ctx2 = ctx.clone();
         std::thread::spawn(move || {
@@ -306,7 +362,7 @@ impl App {
                 Ok((a, _)) if auto && (a.gauges.len() < 17 || a.components.len() < 4 || a.gauges.iter().any(|g| g.doubt)) => {
                     self.auto_note = t!("wacht op de Breakdown in FM", "waiting for the Breakdown in FM").to_string();
                 }
-                Ok((a, _)) if auto && same_values(&self.eff, &a.to_effectiveness("")) => {
+                Ok((a, _)) if auto && same_values(&self.effs[self.analysis_slot.i()], &a.to_effectiveness("")) => {
                     self.auto_note = t!(format!("geen verandering ({})", chrono::Local::now().format("%H:%M:%S")), format!("no change ({})", chrono::Local::now().format("%H:%M:%S"))).to_string();
                 }
                 Err(_) if auto => {
@@ -318,15 +374,15 @@ impl App {
                     }
                     let src_is_screen = src == t!("FM27-scherm", "FM27 screen");
                     let when = chrono::Local::now().format("%d-%m %H:%M");
-                    self.eff = a.to_effectiveness(&format!("{src} · {when}"));
+                    self.effs[self.analysis_slot.i()] = a.to_effectiveness(&format!("{src} · {when}"));
                     // spel-datum erbij, zodat de app weet hoe oud de meting in speltijd is
                     if let Ok(v) = agent::request(json!({"cmd": "game_date"})) {
                         let (y, d) = (v.get("year").and_then(|x| x.as_i64()), v.get("doy").and_then(|x| x.as_u64()));
                         if let (Some(y), Some(d)) = (y, d) {
-                            self.eff.game_date = NaiveDate::from_yo_opt(y as i32, d as u32);
+                            self.effs[self.analysis_slot.i()].game_date = NaiveDate::from_yo_opt(y as i32, d as u32);
                         }
                     }
-                    let _ = crate::save_effectiveness(&self.eff);
+                    let _ = self.save_eff(self.analysis_slot);
                     let mut msg = t!(format!("{} van 17 meters gelezen.", a.gauges.len()), format!("Read {} of 17 gauges.", a.gauges.len())).to_string();
                     if !a.lang.starts_with("english") {
                         msg.push_str(&format!(" (FM: {})", a.lang));
@@ -513,7 +569,7 @@ impl App {
 
     fn page_overview(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         let subtitle = if self.has_data() {
-            t!(format!("Laatst uitgelezen: {}", self.eff.source), format!("Last read: {}", self.eff.source))
+            t!(format!("Laatst uitgelezen: {}", self.effs[self.slot.i()].source), format!("Last read: {}", self.effs[self.slot.i()].source))
         } else {
             t!("Open in FM27 de Breakdown van Tactical Effectiveness en lees hem uit.", "Open the Tactical Effectiveness Breakdown in FM27 and read it.").to_string()
         };
@@ -521,6 +577,8 @@ impl App {
         let mut read = false;
         let mut file = false;
         theme::page_header(ui, "Tactical Effectiveness", &subtitle, |ui| {
+            self.slot_switch(ui);
+            ui.add_space(8.0);
             if theme::button(ui, icon::EXPORT, t!("Uit bestand", "From file"), !busy).clicked() {
                 file = true;
             }
@@ -580,7 +638,7 @@ impl App {
         // onderdelen
         ui.columns(4, |cols| {
             for (i, c) in Component::ALL.iter().enumerate() {
-                let v = self.eff.component(*c);
+                let v = self.effs[self.slot.i()].component(*c);
                 let col = theme::rgb(level_color(v));
                 let ic = [icon::TARGET, icon::SOCCER_BALL, icon::USERS_THREE, icon::EYE][i];
                 theme::stat_tile(&mut cols[i], ic, c.label(), &format!("{v:.0}"), level_name(v), col, Some(v));
@@ -597,12 +655,12 @@ impl App {
                     ui.label(theme::caps(c.label()));
                     ui.add_space(6.0);
                     for f in Factor::ALL.iter().filter(|f| f.component() == *c) {
-                        let v = self.eff.get(*f);
+                        let v = self.effs[self.slot.i()].get(*f);
                         theme::metric_row(ui, f.label(), v, theme::rgb(level_color(v)));
                         if self.edit_mode {
                             let mut nv = v;
                             if ui.add(egui::Slider::new(&mut nv, 0.0..=100.0).show_value(false)).changed() && (nv - v).abs() > 0.01 {
-                                self.eff.set(*f, nv);
+                                self.effs[self.slot.i()].set(*f, nv);
                                 changed = true;
                             }
                         }
@@ -611,11 +669,11 @@ impl App {
             }
         });
         if changed {
-            self.eff.components.clear();
-            if !self.eff.source.ends_with('*') {
-                self.eff.source = format!("{} *", if self.eff.source.is_empty() { t!("handmatig", "manual") } else { &self.eff.source });
+            self.effs[self.slot.i()].components.clear();
+            if !self.effs[self.slot.i()].source.ends_with('*') {
+                self.effs[self.slot.i()].source = format!("{} *", if self.effs[self.slot.i()].source.is_empty() { t!("handmatig", "manual") } else { &self.effs[self.slot.i()].source });
             }
-            let _ = crate::save_effectiveness(&self.eff);
+            let _ = self.save_eff(self.slot);
             self.week_plan = None;
             self.year.clear();
         }
@@ -630,7 +688,7 @@ impl App {
                 ui.label(theme::h2(t!("Prioriteiten", "Priorities")));
             });
             ui.add_space(6.0);
-            for (f, v) in self.eff.weakest().into_iter().take(6) {
+            for (f, v) in self.effs[self.slot.i()].weakest().into_iter().take(6) {
                 ui.horizontal(|ui| {
                     ui.add_sized(vec2(250.0, 20.0), egui::Label::new(theme::label_strong(f.label())));
                     theme::pill(ui, &format!("{v:.0} · {}", level_name(v)), theme::rgb(level_color(v)));
@@ -655,6 +713,8 @@ impl App {
                 "FM27 Trainer plans your training on your weakest areas and keeps it in FM's calendar."
             ),
             |ui| {
+                self.slot_switch(ui);
+                ui.add_space(8.0);
                 if theme::primary_button(ui, icon::LIGHTNING, t!("Zet training nu in FM", "Apply training now"), can).clicked() {
                     write = true;
                 }
@@ -667,12 +727,12 @@ impl App {
             },
         );
         if write {
-            self.live.training(ctx, &self.eff, &self.settings.planner, true, false);
+            self.live.training(ctx, self.slot, &self.effs[self.slot.i()], self.settings.planner_for(self.slot), true);
         }
         if view {
-            self.live.training(ctx, &self.eff, &self.settings.planner, false, false);
+            self.live.training(ctx, self.slot, &self.effs[self.slot.i()], self.settings.planner_for(self.slot), false);
         }
-        let (m, e) = (self.live.train_status.clone(), self.live.train_error);
+        let (m, e) = (self.live.team(self.slot).status.clone(), self.live.team(self.slot).error);
         self.status_line(ui, &m, e);
         // testhulp: FM27_TEAMS_JSON=<bestand> toont de keuze zonder verbinding
         let demo = std::env::var_os("FM27_TEAMS_JSON");
@@ -684,7 +744,7 @@ impl App {
         }
 
         // ---- statusblok: automatisch bijhouden
-        let auto = self.settings.auto_training;
+        let auto = self.settings.auto_for(self.slot);
         let accent = if auto && connected { theme::SUCCESS } else { theme::WARNING };
         Frame::new()
             .fill(theme::tint(accent, 0.10))
@@ -697,9 +757,12 @@ impl App {
                     ui.label(theme::ic(if auto { icon::CHECK_CIRCLE } else { icon::WARNING }).size(30.0).color(accent));
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
-                            ui.label(theme::h2(t!("Training automatisch bijhouden", "Keep training on plan automatically")));
+                            ui.label(theme::h2(match self.slot {
+                                TeamSlot::First => t!("Training eerste elftal automatisch bijhouden", "Keep first-team training on plan automatically"),
+                                TeamSlot::Youth => t!("Training jeugdteam automatisch bijhouden", "Keep youth-team training on plan automatically"),
+                            }));
                             ui.add_space(8.0);
-                            if theme::toggle(ui, &mut self.settings.auto_training).changed() {
+                            if theme::toggle(ui, self.settings.auto_mut(self.slot)).changed() {
                                 self.save_settings();
                             }
                             ui.label(RichText::new(if auto { t!("AAN", "ON") } else { t!("UIT", "OFF") }).strong().color(accent));
@@ -727,10 +790,10 @@ impl App {
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 36.0;
-                        let last = self.live.last_check.map(|t| t.format("%H:%M:%S").to_string()).unwrap_or_else(|| "—".into());
+                        let last = self.live.team(self.slot).last_check.map(|t| t.format("%H:%M:%S").to_string()).unwrap_or_else(|| "—".into());
                         theme::mini_stat(ui, t!("Laatste controle", "Last check"), &last);
-                        theme::mini_stat(ui, t!("Teruggezet (deze sessie)", "Restored (this session)"), &t!(format!("{} dagen", self.live.fixed_total), format!("{} days", self.live.fixed_total)));
-                        let d = self.live.training.as_ref().and_then(|o| o.today).map(i18n::date).unwrap_or_else(|| "—".into());
+                        theme::mini_stat(ui, t!("Teruggezet (deze sessie)", "Restored (this session)"), &t!(format!("{} dagen", self.live.team(self.slot).fixed_total), format!("{} days", self.live.team(self.slot).fixed_total)));
+                        let d = self.live.team(self.slot).training.as_ref().and_then(|o| o.today).map(i18n::date).unwrap_or_else(|| "—".into());
                         theme::mini_stat(ui, t!("Spel-datum", "Game date"), &d);
                     });
                 }
@@ -738,8 +801,8 @@ impl App {
         ui.add_space(14.0);
 
         // ---- zo werkt het: meten → plannen → bijhouden
-        let today = self.live.training.as_ref().and_then(|o| o.today);
-        let age_weeks = match (self.eff.game_date, today) {
+        let today = self.live.team(self.slot).training.as_ref().and_then(|o| o.today);
+        let age_weeks = match (self.effs[self.slot.i()].game_date, today) {
             (Some(d), Some(t)) => Some((t - d).num_days() / 7),
             _ => None,
         };
@@ -753,7 +816,7 @@ impl App {
                     match age_weeks {
                         Some(0) => t!("Uitgelezen deze week (speltijd).", "Read this week (game time).").to_string(),
                         Some(w) => t!(format!("Uitgelezen {w} weken geleden (speltijd)."), format!("Read {w} weeks ago (game time).")),
-                        None => t!(format!("Uitgelezen: {}", self.eff.source), format!("Read: {}", self.eff.source)),
+                        None => t!(format!("Uitgelezen: {}", self.effs[self.slot.i()].source), format!("Read: {}", self.effs[self.slot.i()].source)),
                     }
                 };
                 ui.label(if stale { RichText::new(txt).color(theme::WARNING) } else { theme::dim(txt) });
@@ -767,7 +830,7 @@ impl App {
             });
             step_card(&mut cols[1], 2, icon::TARGET, t!("Plannen", "Plan"), |ui| {
                 ui.label(theme::dim(t!("Extra aandacht voor:", "Extra focus on:")));
-                for (f, v) in self.eff.weakest().into_iter().filter(|(f, _)| f.is_tactical_area()).take(3) {
+                for (f, v) in self.effs[self.slot.i()].weakest().into_iter().filter(|(f, _)| f.is_tactical_area()).take(3) {
                     theme::pill(ui, &format!("{} · {v:.0}", f.label()), theme::rgb(level_color(v)));
                 }
                 ui.add(egui::Label::new(theme::faint(t!(
@@ -806,13 +869,15 @@ impl App {
                 ui.label(theme::h2(t!("Logboek", "Activity")));
             });
             ui.add_space(4.0);
-            if self.live.log.is_empty() {
+            let slot = self.slot;
+            let mine = |e: &&crate::live::LogEntry| e.slot.is_none_or(|s| s == slot);
+            if !self.live.log.iter().any(|e| mine(&e)) {
                 ui.label(theme::faint(t!(
                     "Nog geen aanpassingen. Zodra FM een week anders inplant, zie je hier wat er is teruggezet.",
                     "No changes yet. When FM re-plans a week, you'll see here what was put back."
                 )));
             }
-            for e in self.live.log.iter().take(6) {
+            for e in self.live.log.iter().filter(mine).take(6) {
                 ui.horizontal(|ui| {
                     ui.label(theme::faint(e.at.format("%H:%M:%S").to_string()));
                     theme::pill(ui, if e.auto { t!("automatisch", "automatic") } else { t!("handmatig", "manual") }, if e.auto { theme::SUCCESS } else { theme::ACCENT });
@@ -822,9 +887,10 @@ impl App {
         });
         ui.add_space(14.0);
 
-        let Some(o) = self.live.training.clone() else {
-            if !self.live.busy() {
-                self.live.training(ctx, &self.eff, &self.settings.planner, false, false);
+        let Some(o) = self.live.team(self.slot).training.clone() else {
+            // na een fout (bv. geen jeugdteam) niet elke frame opnieuw proberen
+            if !self.live.busy() && !self.live.team(self.slot).error {
+                self.live.training(ctx, self.slot, &self.effs[self.slot.i()], self.settings.planner_for(self.slot), false);
             }
             return;
         };
@@ -835,7 +901,7 @@ impl App {
         });
         ui.add_space(6.0);
         for w in &o.weeks {
-            week_card(ui, w, o.today, &self.live.fm_had);
+            week_card(ui, w, o.today, &self.live.team(self.slot).fm_had);
             ui.add_space(10.0);
         }
     }
@@ -848,20 +914,27 @@ impl App {
         let Some(data) = self.live.teams.clone() else { return };
         let list = |k: &str| data.get(k).and_then(|v| v.as_array()).cloned().unwrap_or_default();
         let (managers, teams) = (list("managers"), list("teams"));
-        if managers.len() < 2 && teams.len() < 2 {
+        let youth = self.slot == TeamSlot::Youth;
+        if managers.len() < 2 && teams.len() < 2 && !youth {
             return;
         }
+        let num = |t: &Value, k: &str| t.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+        let own = |t: &Value| t.get("own").and_then(|b| b.as_bool()) == Some(true);
         let team_name = |t: &Value| -> String {
-            let n = |k: &str| t.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
-            let name = match (n("kind"), n("age_limit")) {
+            let name = match (num(t, "kind"), num(t, "age_limit")) {
                 (0, _) => t!("Eerste elftal", "First team").to_string(),
                 (_, a) if (1..100).contains(&a) => t!(format!("Onder {a}"), format!("Under {a}")),
-                _ => t!(format!("Team {}", n("index") + 1), format!("Team {}", n("index") + 1)),
+                _ => t!(format!("Team {}", num(t, "index") + 1), format!("Team {}", num(t, "index") + 1)),
             };
-            format!("{name} · {} {}", n("players"), t!("spelers", "players"))
+            format!("{name} · {} {}", num(t, "players"), t!("spelers", "players"))
         };
         let sel = |v: &Value| v.get("selected").and_then(|b| b.as_bool()) == Some(true);
+        // het team van elke trainer: eerste elftal = de keuze of het eigen team, jeugd = de (gevonden) keuze
+        let first_idx = self.settings.training_team.or_else(|| teams.iter().find(|t| own(t)).map(|t| num(t, "index") as usize));
+        let youth_idx = self.live.youth_team;
+        let current = if youth { youth_idx } else { first_idx };
         let mut pick: Option<(Option<u32>, Option<usize>)> = None;
+        let mut youth_pick: Option<usize> = None;
         theme::card(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(theme::ic(icon::USERS_THREE).color(theme::ACCENT));
@@ -878,47 +951,106 @@ impl App {
                     });
                     ui.add_space(14.0);
                 }
-                if teams.len() > 1 {
-                    ui.label(t!("Training van", "Training of"));
-                    let cur = teams.iter().find(|x| sel(x)).map(&team_name).unwrap_or_else(|| "?".into());
-                    egui::ComboBox::from_id_salt("team_pick").selected_text(cur).width(210.0).show_ui(ui, |ui| {
+                if teams.len() > 1 || youth {
+                    ui.label(if youth { t!("Team van de jeugdtrainer", "Youth trainer's team") } else { t!("Team van de trainer", "Trainer's team") });
+                    let cur = teams
+                        .iter()
+                        .find(|x| Some(num(x, "index") as usize) == current)
+                        .map(&team_name)
+                        .unwrap_or_else(|| t!("geen", "none").into());
+                    egui::ComboBox::from_id_salt(if youth { "team_pick_youth" } else { "team_pick" }).selected_text(cur).width(210.0).show_ui(ui, |ui| {
                         for x in &teams {
-                            if ui.selectable_label(sel(x), team_name(x)).clicked() && !sel(x) {
-                                let own = x.get("own").and_then(|b| b.as_bool()) == Some(true);
-                                let idx = x["index"].as_u64().unwrap_or(0) as usize;
-                                pick = Some((self.settings.manager_club, if own { None } else { Some(idx) }));
+                            let idx = num(x, "index") as usize;
+                            let is = Some(idx) == current;
+                            if ui.selectable_label(is, team_name(x)).clicked() && !is {
+                                if youth {
+                                    youth_pick = Some(idx);
+                                } else {
+                                    pick = Some((self.settings.manager_club, if own(x) { None } else { Some(idx) }));
+                                }
                             }
                         }
                     });
                 }
             });
-            if teams.iter().any(|x| sel(x) && x.get("own").and_then(|b| b.as_bool()) != Some(true)) {
-                ui.add_space(4.0);
-                ui.add(
-                    egui::Label::new(theme::dim(t!(
-                        "Dit is niet je eigen team. De app kan zijn training alleen plannen als FM er een eigen kalender voor bijhoudt (jij regelt de training van dit team). Het plan gebruikt de waarden die je het laatst hebt uitgelezen.",
-                        "This is not your own team. The app can only plan its training if FM keeps a calendar of its own for it (you run this team's training). The plan uses the values you read last."
-                    )))
-                    .wrap(),
-                );
+            let note = if youth && youth_idx.is_none() {
+                Some(t!(
+                    "Geen jeugdteam gevonden bij je club. Kies hierboven het team van deze trainer.",
+                    "No youth team found at your club. Pick this trainer's team above."
+                ))
+            } else if youth && youth_idx == first_idx {
+                Some(t!(
+                    "Beide trainers gebruiken nu hetzelfde team: kies voor een van de twee een ander team.",
+                    "Both trainers now use the same team: pick a different team for one of them."
+                ))
+            } else if youth {
+                Some(t!(
+                    "De jeugdtrainer heeft een eigen meting en eigen instellingen. Lees de Breakdown van dit team op Overzicht uit met 'Jeugdteam' gekozen. FM houdt alleen een eigen kalender bij als jij de training van dit team regelt.",
+                    "The youth trainer has its own reading and its own settings. Read this team's Breakdown on Overview with 'Youth team' selected. FM only keeps a calendar of its own if you run this team's training."
+                ))
+            } else if teams.iter().any(|x| Some(num(x, "index") as usize) == first_idx && !own(x)) {
+                Some(t!(
+                    "Dit is niet je eigen team. De app kan zijn training alleen plannen als FM er een eigen kalender voor bijhoudt (jij regelt de training van dit team).",
+                    "This is not your own team. The app can only plan its training if FM keeps a calendar of its own for it (you run this team's training)."
+                ))
             } else if managers.len() > 1 {
+                Some(t!(
+                    "Club, selectie, transfers en training horen bij de gekozen manager. Lees de Breakdown van dit team opnieuw uit voordat je de training laat plannen.",
+                    "Club, squad, transfers and training follow the chosen manager. Read this team's Breakdown again before you let the app plan its training."
+                ))
+            } else {
+                None
+            };
+            if let Some(n) = note {
                 ui.add_space(4.0);
-                ui.add(
-                    egui::Label::new(theme::dim(t!(
-                        "Club, selectie, transfers en training horen bij de gekozen manager. Lees de Breakdown van dit team opnieuw uit voordat je de training laat plannen.",
-                        "Club, squad, transfers and training follow the chosen manager. Read this team's Breakdown again before you let the app plan its training."
-                    )))
-                    .wrap(),
-                );
+                ui.add(egui::Label::new(theme::dim(n)).wrap());
             }
         });
         ui.add_space(14.0);
         if let Some((club, team)) = pick {
+            // een andere manager: het jeugdteam van de vorige club geldt niet meer
+            if club != self.settings.manager_club {
+                self.settings.youth_team = None;
+            }
             self.settings.manager_club = club;
             self.settings.training_team = team;
             self.save_settings();
             self.live.choose(ctx, (club, team));
         }
+        if let Some(idx) = youth_pick {
+            self.settings.youth_team = Some(idx);
+            self.save_settings();
+            self.live.youth_team = Some(idx);
+            let t = &mut self.live.train[TeamSlot::Youth.i()];
+            t.training = None;
+            t.fm_had.clear();
+            t.status.clear();
+            t.error = false;
+        }
+    }
+
+    /// Wissel tussen de trainer van het eerste elftal en die van het jeugdteam.
+    fn slot_switch(&mut self, ui: &mut Ui) {
+        let mut s = self.slot;
+        if theme::segmented(ui, &mut s, &[(TeamSlot::First, TeamSlot::First.label()), (TeamSlot::Youth, TeamSlot::Youth.label())]) && s != self.slot {
+            self.slot = s;
+            self.week_plan = None;
+            self.year.clear();
+        }
+    }
+
+    /// Plek van het jeugdteam: de keuze van de gebruiker als die in de teamlijst staat, anders het
+    /// eerste team van de club dat niet het eerste elftal en niet het eigen team is.
+    fn youth_team(&self) -> Option<usize> {
+        let teams = self.live.teams.as_ref()?.get("teams")?.as_array()?;
+        let idx = |t: &Value| t.get("index").and_then(|v| v.as_u64()).map(|n| n as usize);
+        if let Some(i) = self.settings.youth_team {
+            return teams.iter().any(|t| idx(t) == Some(i)).then_some(i);
+        }
+        teams
+            .iter()
+            .find(|t| t.get("own").and_then(|b| b.as_bool()) != Some(true) && t.get("kind").and_then(|v| v.as_u64()).unwrap_or(0) != 0)
+            .and_then(idx)
     }
 
     fn page_planning(&mut self, ui: &mut Ui) {
@@ -928,6 +1060,8 @@ impl App {
             "Planning",
             t!("Week- en seizoensplan als overzicht en export (werkt ook zonder module).", "Weekly and season plan as overview and export (works without the module)."),
             |ui| {
+                self.slot_switch(ui);
+                ui.add_space(8.0);
                 theme::segmented(ui, &mut tab, &[(PlanTab::Week, "Week"), (PlanTab::Season, t!("Seizoen", "Season"))]);
             },
         );
@@ -964,11 +1098,11 @@ impl App {
                         .map(planner::monday_of)
                         .unwrap_or_else(|_| planner::monday_of(chrono::Local::now().date_naive()));
                     let week = CalendarWeek { start, kind: self.week_kind, matches: self.week_matches, note: String::new() };
-                    self.week_plan = Some(planner::plan_week(&week, self.prev_sunday, self.next_monday, &self.eff, &self.settings.planner, 1));
+                    self.week_plan = Some(planner::plan_week(&week, self.prev_sunday, self.next_monday, &self.effs[self.slot.i()], self.settings.planner_for(self.slot), 1));
                 }
                 if let Some(p) = self.week_plan.clone() {
                     if theme::button(ui, icon::EXPORT, t!("Exporteer & open", "Export & open"), true).clicked() {
-                        let r = export::write_all(&export::output_dir(), "weekplan", t!("FM27 weekplan", "FM27 week plan"), &self.eff, std::slice::from_ref(&p));
+                        let r = export::write_all(&export::output_dir(), "weekplan", t!("FM27 weekplan", "FM27 week plan"), &self.effs[self.slot.i()], std::slice::from_ref(&p));
                         self.after_export(r);
                     }
                 }
@@ -1033,12 +1167,12 @@ impl App {
                     self.save_calendar();
                 }
                 if theme::primary_button(ui, icon::SPARKLE, t!("Maak seizoensplan", "Build season plan"), true).clicked() {
-                    self.year = planner::plan_year(&self.calendar, &self.eff, &self.settings.planner);
+                    self.year = planner::plan_year(&self.calendar, &self.effs[self.slot.i()], self.settings.planner_for(self.slot));
                     self.save_calendar();
                 }
                 if !self.year.is_empty() {
                     if theme::button(ui, icon::EXPORT, t!("Exporteer & open", "Export & open"), true).clicked() {
-                        let r = export::write_all(&export::output_dir(), "seasonplan", t!("FM27 seizoensplan", "FM27 season plan"), &self.eff, &self.year);
+                        let r = export::write_all(&export::output_dir(), "seasonplan", t!("FM27 seizoensplan", "FM27 season plan"), &self.effs[self.slot.i()], &self.year);
                         self.after_export(r);
                     }
                     let (n, u) = (self.year.len(), unique_schedules(&self.year).len());
@@ -2198,19 +2332,29 @@ impl App {
                 dirty |= ui.checkbox(&mut self.settings.capture_delay, t!("FM eerst naar voren halen bij uitlezen", "Bring FM to front before reading")).changed();
             });
             theme::card(&mut cols[1], |ui| {
-                ui.label(theme::h2("Planner"));
+                ui.horizontal(|ui| {
+                    ui.label(theme::h2("Planner"));
+                    ui.add_space(8.0);
+                    self.slot_switch(ui);
+                });
+                ui.add(egui::Label::new(theme::faint(t!(
+                    "Elke trainer heeft zijn eigen instellingen.",
+                    "Each trainer has its own settings."
+                ))).wrap());
                 ui.add_space(6.0);
+                let slot = self.slot;
+                let pl = self.settings.planner_mut(slot);
                 ui.horizontal(|ui| {
                     ui.label(t!("Team Bonding onder Buy-In", "Team Bonding below Buy-In"));
-                    dirty |= ui.add(egui::Slider::new(&mut self.settings.planner.bonding_below, 0.0..=100.0).fixed_decimals(0)).changed();
+                    dirty |= ui.add(egui::Slider::new(&mut pl.bonding_below, 0.0..=100.0).fixed_decimals(0)).changed();
                 });
                 ui.horizontal(|ui| {
                     ui.label(t!("Standaardsituaties elke (weken, 0 = uit)", "Set pieces every (weeks, 0 = off)"));
-                    dirty |= ui.add(egui::DragValue::new(&mut self.settings.planner.set_pieces_every).range(0..=8)).changed();
+                    dirty |= ui.add(egui::DragValue::new(&mut pl.set_pieces_every).range(0..=8)).changed();
                 });
                 ui.horizontal(|ui| {
                     ui.label(t!("Doelen bijstellen elke (weken)", "Re-target every (weeks)"));
-                    dirty |= ui.add(egui::DragValue::new(&mut self.settings.planner.replan_every_weeks).range(1..=8)).changed();
+                    dirty |= ui.add(egui::DragValue::new(&mut pl.replan_every_weeks).range(1..=8)).changed();
                 });
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
@@ -2218,12 +2362,12 @@ impl App {
                     use planner::Load;
                     dirty |= theme::segmented(
                         ui,
-                        &mut self.settings.planner.load,
+                        &mut pl.load,
                         &[(Load::Light, t!("Meer rust", "More rest")), (Load::Balanced, t!("Gebalanceerd", "Balanced")), (Load::Intense, t!("Minder rust", "Less rest"))],
                     );
                 });
                 ui.add(
-                    egui::Label::new(theme::dim(match self.settings.planner.load {
+                    egui::Label::new(theme::dim(match pl.load {
                         planner::Load::Light => t!(
                             "Elke trainingsdag en de dag voor een wedstrijd eindigt met Rest.",
                             "Every training day and the day before a match ends with Rest."
@@ -2238,7 +2382,7 @@ impl App {
                 );
                 ui.add_space(6.0);
                 dirty |= ui
-                    .checkbox(&mut self.settings.planner.no_tactical, t!("Geen tactische sessies", "No tactical sessions"))
+                    .checkbox(&mut pl.no_tactical, t!("Geen tactische sessies", "No tactical sessions"))
                     .changed();
                 ui.add(
                     egui::Label::new(theme::dim(t!(
@@ -2359,7 +2503,12 @@ impl eframe::App for App {
         self.live.allow_untested = self.settings.allow_untested;
         self.live.choice = (self.settings.manager_club, self.settings.training_team);
         self.live.keep_understanding = self.settings.keep_understanding;
-        self.live.tick(ctx, &self.eff, &self.settings.planner, self.settings.auto_training);
+        self.live.youth_team = self.youth_team();
+        let inputs = [
+            TrainInput { eff: &self.effs[0], settings: &self.settings.planner, auto: self.settings.auto_training },
+            TrainInput { eff: &self.effs[1], settings: &self.settings.planner_youth, auto: self.settings.auto_training_youth },
+        ];
+        self.live.tick(ctx, inputs);
         self.sidebar(ctx);
         egui::CentralPanel::default()
             .frame(Frame::new().fill(theme::BG).inner_margin(Margin { left: 28, right: 28, top: 24, bottom: 16 }))

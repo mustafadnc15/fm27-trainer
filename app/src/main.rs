@@ -44,6 +44,22 @@ fn effectiveness_file() -> PathBuf {
     data_dir().join("effectiveness.json")
 }
 
+/// De uitgelezen waarden van het jeugdteam: een eigen trainer met eigen meting.
+fn youth_effectiveness_file() -> PathBuf {
+    data_dir().join("effectiveness-youth.json")
+}
+
+fn load_youth_effectiveness() -> Option<Effectiveness> {
+    let s = std::fs::read_to_string(youth_effectiveness_file()).ok()?;
+    serde_json::from_str(&s).ok()
+}
+
+fn save_youth_effectiveness(e: &Effectiveness) -> Result<()> {
+    std::fs::create_dir_all(data_dir())?;
+    std::fs::write(youth_effectiveness_file(), serde_json::to_string_pretty(e)?)?;
+    Ok(())
+}
+
 fn load_effectiveness() -> Option<Effectiveness> {
     let s = std::fs::read_to_string(effectiveness_file()).ok()?;
     serde_json::from_str(&s).ok()
@@ -149,7 +165,7 @@ fn cli(args: &[String]) -> Result<bool> {
         Some("train") => {
             let eff = load_effectiveness().context("nog geen uitgelezen waarden")?;
             let write = args.iter().any(|a| a == "--write");
-            let o = live_training::run(&eff, &planner::PlannerSettings::default(), write, &Default::default())?;
+            let o = live_training::run(&eff, &planner::PlannerSettings::default(), write, &Default::default(), &serde_json::Value::Null)?;
             println!("spel-datum {:?}, {} dagen geschreven", o.today, o.written_days);
             for w in &o.weeks {
                 println!("week {} ({}W, {})", w.start, w.matches, w.focus);
